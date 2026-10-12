@@ -1,0 +1,38 @@
+# --- Never publish: game files and code derived from them -------------------------------------
+# The game itself (bring your own copy)
+*.exe
+cddata/
+# Ghidra project and its exports: decompiled game code, reconstructed headers, analysis dumps
+proj/
+proj.bak-before-recover/
+out/
+src/
+notes/*.tsv
+notes/*.txt
+notes/analyse.py
+port/flush_replacement.txt
+# Translated game code and every binary built from it (contain the game's code)
+recomp/build/*
+!recomp/build/discovered.txt
+recomp/perfect_recomp
+recomp/perfect_recomp_gl
+recomp/perfect_recomp_linux
+
+# --- Local outputs ------------------------------------------------------------------------------
+recomp/snapshot/
+recomp/tex/
+recomp/.venv/
+recomp/linux/*.log
+__pycache__/
+port/graphic_demo
+port/gs_demo
+port/dma_demo
+port/model_demo
+port/txm2png
+port/cull_test
+port/*.dSYM/
+port/snapshot/
+
+# macOS metadata (.DS_Store, AppleDouble files from copying over a Mac volume)
+.DS_Store
+._*

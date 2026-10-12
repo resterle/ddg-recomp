@@ -1,0 +1,127 @@
+"""perfect.exe as the build and the game see it.
+
+The input is the unprotected perfect.exe of Densha de GO! FINAL (PC). The copy on the CD is
+protected by SafeDisc (sections stxt774/stxt371, encrypted code) and cannot be used.
+
+DDGModernizer (github.com/hunterbridges/DDGModernizer, MIT licence) patches the exe for
+widescreen and draw distance, with a few code fixes those settings need. Its patch list for
+FINAL is data/ddgmodernizer-final.txt (unchanged). The build applies all of it in memory with
+fixed values (`CANON`: the original 4:3 aspect and draw distances), so a plain perfect.exe and
+one already patched by DDGModernizer (any settings) give the same image. The game applies the
+same patches when it loads the exe (host/runtime.c, table in build/game/exe_info.c) and then
+writes the player's settings over those values (plan.IMM_OVERRIDES, host/native.cpp
+ApplyGameSettings).
+
+`image_hash` identifies the patched image; the build records it and the game refuses an exe
+with another hash (another version, a translation patch, ...), because the translated code is
+only valid for the exe it was generated from.
+"""
+import os, re, struct
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PATCH_FILE = os.path.join(HERE, 'data', 'ddgmodernizer-final.txt')
+# Values for the patch arguments: the game's own (RendPow 0.9 and OkiDistArg 0.4 are what the
+# unpatched exe holds; aspect 1.0 / 0.5 is the original 4:3 projection).
+CANON = {'AspectX': 1.0, 'AspectY': 0.5, 'RendPow': 0.9, 'OkiDistArg': 0.4}
+
+
+class ExeError(Exception):
+    pass
+
+
+def parse_patches(path=PATCH_FILE):
+    """[(file offset, original bytes, [byte value or argument name, ...])] for every line."""
+    out = []
+    for line in open(path, encoding='utf-8-sig').read().splitlines():
+        line = line.strip()
+        if not line.startswith('$'):
+            continue                                    # [module], <argument>, ;comment
+        off, orig, new = [p.strip() for p in line[1:].split(',')]
+        tmpl = []
+        for tok in re.findall(r'\(\w+\)|[0-9A-Fa-f]{2}', new):
+            tmpl.append(tok[1:-1] if tok.startswith('(') else int(tok, 16))
+        out.append((int(off, 16), bytes(int(b, 16) for b in orig.split()), tmpl))
+    return out
+
+
+def expand(tmpl, values=CANON):
+    """Template -> (bytes, mask): mask 0 where an argument goes (any value matches there)."""
+    data, mask = bytearray(), bytearray()
+    for t in tmpl:
+        if isinstance(t, int):
+            data.append(t); mask.append(1)
+        else:
+            data += struct.pack('<f', values[t]); mask += b'\0\0\0\0'
+    return bytes(data), bytes(mask)
+
+
+def sections(data):
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    if data[:2] != b'MZ' or data[pe:pe + 4] != b'PE\0\0':
+        raise ExeError('not a Windows executable')
+    n = struct.unpack_from('<H', data, pe + 6)[0]
+    so = pe + 24 + struct.unpack_from('<H', data, pe + 20)[0]
+    out = []
+    for i in range(n):
+        name, vs, va, rs, ra = struct.unpack_from('<8sIIII', data, so + 40 * i)
+        out.append((name.rstrip(b'\0').decode('latin1'), vs, va, rs, ra))
+    return out
+
+
+def is_safedisc(data):
+    return any(s[0] in ('stxt774', 'stxt371') for s in sections(data))
+
+
+def normalize(data):
+    """Apply the patch list. Returns (patched bytes, number of sites that matched neither the
+    original nor the patched form)."""
+    if is_safedisc(data):
+        raise ExeError('this perfect.exe is the SafeDisc-protected original from the CD; '
+                       'an unprotected perfect.exe is needed')
+    d = bytearray(data)
+    unknown = 0
+    for off, orig, tmpl in parse_patches():
+        new, mask = expand(tmpl)
+        cur = d[off:off + len(new)]
+        if cur[:len(orig)] == orig or all(m == 0 or c == b for c, b, m in zip(cur, new, mask)):
+            d[off:off + len(new)] = new
+        else:
+            unknown += 1
+    return bytes(d), unknown
+
+
+def image_hash(data):
+    """FNV-1a 64 over the file bytes of every section, as host/runtime.c maps them."""
+    h = 0xcbf29ce484222325
+    for name, vs, va, rs, ra in sections(data):
+        n = rs if rs < vs or not vs else vs
+        for b in data[ra:ra + n]:
+            h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+
+def load(path):
+    """Read and normalise the exe; raises ExeError with a message for the player."""
+    if not os.path.isfile(path):
+        raise ExeError('%s not found: copy perfect.exe there or set PERFECT_EXE=<path>' % path)
+    data, unknown = normalize(open(path, 'rb').read())
+    if unknown:
+        raise ExeError('%s is not a known version of perfect.exe (%d patch sites differ)' % (path, unknown))
+    return data
+
+
+def c_table(data):
+    """C source for the runtime: the patch sites (file offsets, original and patched bytes with
+    mask) and the expected image hash."""
+    lines = ['#include <stdint.h>', '// Generated by build_game.py from data/ddgmodernizer-final.txt (see exepatch.py).',
+             'typedef struct { uint32_t off, len; const uint8_t *orig, *data, *mask; uint32_t origLen; } RtExePatch;']
+    rows = []
+    for i, (off, orig, tmpl) in enumerate(parse_patches()):
+        new, mask = expand(tmpl)
+        arr = lambda b: '{' + ','.join('0x%02x' % x for x in b) + '}'
+        lines.append('static const uint8_t p%d_o[] = %s, p%d_d[] = %s, p%d_m[] = %s;' % (i, arr(orig), i, arr(new), i, arr(mask)))
+        rows.append('    {0x%x, %d, p%d_o, p%d_d, p%d_m, %d},' % (off, len(new), i, i, i, len(orig)))
+    lines.append('const RtExePatch rt_exe_patches[] = {\n' + '\n'.join(rows) + '\n};')
+    lines.append('const int rt_exe_npatches = %d;' % len(rows))
+    lines.append('const uint64_t rt_exe_hash = 0x%016xull;' % image_hash(data))
+    return '\n'.join(lines) + '\n'

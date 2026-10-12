@@ -1,0 +1,3 @@
+# Translator (build_game.py)
+capstone==5.0.9
+# Only for the differential tester (verify.py): pip install unicorn
