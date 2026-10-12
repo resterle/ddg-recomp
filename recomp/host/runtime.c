@@ -2,6 +2,7 @@
 // See runtime.h for the memory layout and the threading model.
 
 #define _GNU_SOURCE                     // dladdr
+#include <ctype.h>
 #include "runtime.h"
 #include "guestmem.h"
 #include <errno.h>
@@ -275,6 +276,21 @@ uint32_t rt_create_thread(uint32_t start, uint32_t param, int suspended, uint32_
     return t->handle;
 }
 
+// CPU time of a guest thread given its handle, in ns (0 if unknown or finished; Linux only).
+uint64_t rt_thread_cpu_ns(uint32_t handle)
+{
+#ifdef __linux__
+    RtThread *t = rt_handle_get(handle, H_THREAD);
+    clockid_t c;
+    struct timespec ts;
+    if (!t || t->finished || pthread_getcpuclockid(t->th, &c) || clock_gettime(c, &ts)) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#else
+    (void)handle;
+    return 0;
+#endif
+}
+
 void rt_thread_resume(RtThread *t) { t->suspended = 0; rt_signal_obj(&t->suspended); }
 int rt_thread_finished(RtThread *t) { return t->finished; }
 uint32_t rt_thread_exitcode(RtThread *t) { return t->exitCode; }
@@ -347,15 +363,37 @@ void rt_handle_close(uint32_t h)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Heap: size-class free lists over a bump region. Header (8 bytes): size, magic.
+// Heap: size-class free lists over a bump region. Header (8 bytes): size, then the tag: magic in
+// the low 24 bits, size class in the top byte.
 
-#define HEAP_MAGIC 0x48454150u
+#define HEAP_MAGIC 0x00454150u
 static uint32_t g_heapTop = RT_HEAP_BASE;
 static uint32_t g_free[32];                 // free list heads per power-of-two class
+static uint64_t g_heapLive;                 // bytes in allocated blocks (trace)
 
 static int size_class(uint32_t n) { int c = 4; while ((1u << c) < n) c++; return c; }
 
 uint32_t rt_heap_top(void) { return g_heapTop; }
+uint64_t rt_heap_live(void) { return g_heapLive; }
+
+// Resident size of the guest memory (the "guest" memfd mappings), in KB; 0 where unknown.
+uint64_t rt_guest_rss_kb(void)
+{
+    uint64_t kb = 0;
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) return 0;
+    char line[512];
+    int guest = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long v;
+        if (isxdigit((unsigned char)line[0]) && strchr(line, '-')) guest = strstr(line, "memfd:guest") != NULL;
+        else if (guest && sscanf(line, "Rss: %lu kB", &v) == 1) kb += v;
+    }
+    fclose(f);
+#endif
+    return kb;
+}
 
 uint32_t rt_heap_alloc(uint32_t size, int zero)
 {
@@ -370,7 +408,8 @@ uint32_t rt_heap_alloc(uint32_t size, int zero)
         g_heapTop += n;
     }
     WR32(blk, size);
-    WR32(blk + 4, HEAP_MAGIC | (uint32_t)c << 24);
+    WR32(blk + 4, HEAP_MAGIC | (uint32_t)c << 24);   // class 4..31
+    g_heapLive += 1u << c;
     if (zero) memset(MEM + blk + 8, 0, (1u << c) - 8);
     return blk + 8;
 }
@@ -379,8 +418,10 @@ void rt_heap_free(uint32_t a)
 {
     if (!a) return;
     uint32_t blk = a - 8, tag = RD32(blk + 4);
-    if ((tag & 0x00ffffffu) != (HEAP_MAGIC & 0x00ffffffu)) return;     // not ours: ignore
+    if ((tag & 0x00ffffffu) != HEAP_MAGIC) return;     // not ours or already free: ignore
     int c = tag >> 24;
+    if (c < 4 || c > 31) return;
+    g_heapLive -= 1u << c;
     WR32(blk + 4, 0);
     WR32(blk + 8, g_free[c]);
     g_free[c] = blk;

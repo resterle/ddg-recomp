@@ -63,6 +63,8 @@ class Lifter:
         self.inline_leaves = not os.environ.get('LIFT_NO_INLINE')      # inline small leaf functions
         # ... also with x87 code (opt-in: identical results, but no measurable gain on the PC)
         self.inline_x87 = bool(os.environ.get('LIFT_INLINE_X87'))
+        # reverse engineering: functions that can be switched off at run time (RECOMP_SKIP)
+        self.skippable = {int(a, 16) for a in os.environ.get('LIFT_SKIPPABLE', '').replace(',', ' ').split()}
         self.addr64 = not os.environ.get('LIFT_NO_ADDR64')            # 64-bit signed address arithmetic
         self.preserve = not os.environ.get('LIFT_NO_PRESERVE')        # skip callee-saved round trips
         self.cur_mask = 0
@@ -1256,6 +1258,8 @@ class Lifter:
                 return ''.join('fs_[%d] = R.st[(ftop0_ + %du) & 7]; ' % (j, (K - 1 - j) & 0xffffffff) for j in range(cur))
         else:
             fpu = None
+        if entry in self.skippable:         # returns at once when switched off (like a bare ret)
+            out.append('    if (rt_skip(0x%xu)) { esp += 4; RT_RETM(%d); }' % (entry, self.cur_mask))
         addrs = sorted(insns)
         body = []
         # code shared from below the entry (e.g. a common exit sequence) is emitted first

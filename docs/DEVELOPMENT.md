@@ -619,6 +619,14 @@ Port (`port/src/unb`):
 
 ---
 
+- **Heap tag bug (fixed 2026-10-12):** `rt_heap_alloc` tagged blocks `HEAP_MAGIC | class << 24`
+  with a magic whose top byte was 0x48, so the class read back as 72..95. Freed blocks went to
+  free-list slots past the 32-entry array (overwriting the statics after it) and were never
+  reused, and `rt_heap_realloc` could grow a block in place over its neighbours. Since the fix
+  the heap stops growing once a route is loaded (~50 MB live on the Osaka Loop). Freed memory
+  is now reused without being cleared, as with the Windows heap. `RECOMP_TRACE_TICKS` reports
+  live heap, the VirtualAlloc top (unused during play) and the guest memory's resident size.
+
 ## 5a. Sound
 
 The game's own sound code is translated: `CSound`/`CSample` (0x407ea0–0x40a2e0: 25 voices at
@@ -675,6 +683,8 @@ reproducible):
 | graphics.ini `maxfps = <n>` | draw at most n frames per second (60/n ticks apart), game logic stays at 60 Hz |
 | `RECOMP_GL_EARLY_UPLOADS=0`, `RECOMP_GL_UPLOAD_BUDGET=<ms>` | GL: no texture uploads ahead / stand-ins (3b, scenery changes); per-frame upload time before model textures get stand-ins (default 3, 0 = always wait) |
 | `RECOMP_PROFILE=<file>` | Linux: CPU sampling profile (1 sample per ms of CPU time, all threads), written at exit; `tools/profile.py <file> <binary> [top] [thread]` prints the hottest functions per thread |
+| `RECOMP_TRACE_TASKS=1` | with `RECOMP_TRACE_TICKS`: the game's cooperative tasks (id, priority, entry, CPU ms/tick) every 10 s; see [TASKS.md](TASKS.md) |
+| `RECOMP_SUSPEND_TASK=<entry>@<s>[,...]` | keep the task with that entry suspended from tick time s (find out what a task does) |
 | `RECOMP_EXIT_AFTER=<s>` | quit after s seconds of tick time (scripted runs, PGO) |
 | `RECOMP_CLEAR_FLUSH=1` | old render-pass clears (A/B comparison) |
 | `RECOMP_TRACE_VIEWPORT` | SetViewport calls (the game never calls it so far) |
@@ -772,7 +782,9 @@ Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SA
 4. **Sound**: works (see 5a). Not done: 3D/position effects (the game doesn't use them on
    PC), tuning of the overall loudness against the original.
 5. **Movies**: skipped (DirectShow). Could be decoded with FFmpeg if wanted.
-6. **Joystick/mascon controllers**: not supported (0x405ef0/0x406000/0x406040 report none).
+6. **Joystick/mascon controllers**: not supported (0x405ef0/0x406000/0x406040 report none). The
+   game's notch variables and input logic are mapped in [TASKS.md](TASKS.md#controls-power-and-brake-notch)
+   (power `0x751a04`, brake `0x751a00`, the two input schemes): the starting point for support.
 7. SDL GPU has Metal (MSL source) and Vulkan (SPIR-V, see 3c) shaders; D3D12 (DXIL) is missing.
    Linux handhelds without Vulkan use the GLES backend (3a).
 8. 118 functions fail translation (MMX/SSE/3DNow! D3DX math). Not hit so far; if a trap reports

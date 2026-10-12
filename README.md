@@ -174,8 +174,9 @@ Win32, DirectSound, DirectInput, D3DX     ->  shims and native replacements (rec
 
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) has the full notes: architecture details,
 everything found and fixed along the way, performance measurements, the debugging environment
-variables and known issues. [`notes/game-structure.md`](notes/game-structure.md) describes the
-executable's layout.
+variables and known issues. [`docs/TASKS.md`](docs/TASKS.md) maps the game logic: its tasks and
+modes, the driving loop, the train's variables and the power/brake controls.
+[`notes/game-structure.md`](notes/game-structure.md) describes the executable's layout.
 
 ## Repository layout
 

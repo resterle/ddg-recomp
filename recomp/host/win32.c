@@ -244,6 +244,7 @@ static void imp_VirtualAlloc(void)
     RT_RETURN(a, 16);
 }
 static void imp_VirtualFree(void) { RT_RETURN(1, 12); }
+uint32_t rt_virt_top(void) { return g_virtTop; }
 static void imp_IsBadReadPtr(void) { RT_RETURN(0, 8); }
 static void imp_IsBadWritePtr(void) { RT_RETURN(0, 8); }
 static void imp_IsBadCodePtr(void) { RT_RETURN(0, 4); }

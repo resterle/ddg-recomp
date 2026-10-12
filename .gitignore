@@ -5,6 +5,7 @@ cddata/
 # Ghidra project and its exports: decompiled game code, reconstructed headers, analysis dumps
 proj/
 proj.bak-before-recover/
+proj-linux/
 out/
 src/
 notes/*.tsv

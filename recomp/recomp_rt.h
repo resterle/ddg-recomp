@@ -97,6 +97,10 @@ void RT_CallAddr(uint32_t addr);
 extern "C"
 #endif
 void RT_Fatal(const char *what, uint32_t addr);
+#ifdef __cplusplus
+extern "C"
+#endif
+int rt_skip(uint32_t addr);         // LIFT_SKIPPABLE functions: switched off now? (RECOMP_SKIP)
 
 // Test builds record which 4 KB pages were written (verify.py compares only those).
 #ifdef RT_TRACK_WRITES

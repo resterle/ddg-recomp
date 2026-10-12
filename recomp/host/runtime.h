@@ -56,11 +56,15 @@ uint32_t rt_create_thread(uint32_t start, uint32_t param, int suspended, uint32_
 enum { H_NONE, H_FILE, H_EVENT, H_SEMAPHORE, H_THREAD, H_MAPPING, H_HEAP, H_FIND, H_STD };
 uint32_t rt_handle_new(int kind, void *obj);
 void *rt_handle_get(uint32_t h, int kind);
+uint64_t rt_thread_cpu_ns(uint32_t handle);   // guest thread CPU time (Linux), 0 if unknown
 void rt_handle_close(uint32_t h);
 
 // Memory helpers
 uint32_t rt_heap_alloc(uint32_t size, int zero);
 uint32_t rt_heap_top(void);
+uint64_t rt_heap_live(void);        // bytes in allocated heap blocks
+uint64_t rt_guest_rss_kb(void);     // resident guest memory (Linux)
+uint32_t rt_virt_top(void);         // end of the VirtualAlloc region in use
 uint64_t rt_thread_instructions(void);           // this thread's retired instructions (macOS)
 uint64_t rt_locked_instructions(void);           // total retired while holding the runtime lock                    // end of the used heap area (diagnostics)
 uint32_t rt_host_fn(void (*fn)(void));          // a callable guest address for a host function

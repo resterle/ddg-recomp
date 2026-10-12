@@ -12,6 +12,7 @@
 #include "../../port/src/unb/Texture.h"
 #include "../../port/src/unb/Vertex.h"
 #include <SDL3/SDL.h>
+#include <unordered_map>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <libproc.h>
@@ -332,6 +333,41 @@ static int g_frameskipMax;
 static uint32_t g_drawInterval = 1;
 static uint32_t g_framesSkipped;
 static uint64_t g_tickLateNs, g_tickPeriodNs;  // how late the current tick started (message loop)
+// RECOMP_SKIP=<addr>@<s>[,...]: functions translated with LIFT_SKIPPABLE return at once from tick
+// time s on (reverse engineering: what does this function do?).
+extern "C" int rt_skip(uint32_t addr)
+{
+    static const char *spec = getenv("RECOMP_SKIP");
+    if (!spec) return 0;
+    double now = TickMs() / 1000.0;
+    for (const char *p = spec; *p;) {
+        uint32_t a = (uint32_t)strtoul(p, (char **)&p, 16);
+        double from = *p == '@' ? strtod(p + 1, (char **)&p) : 0;
+        if (a == addr && now >= from) return 1;
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+// RECOMP_TRACE_TASKS: the game's cooperative tasks (scheduler 0x41ab70; list head 0x758208, next
+// at +0x0c; created by 0x41ad00(id, entry, arg, stack, priority | wait << 8)) with their CPU time
+// over the last 600 ticks (each task runs on its own guest thread, handle at +0x28).
+static void TraceTasks()
+{
+    static std::unordered_map<uint32_t, uint64_t> lastCpu;
+    fprintf(stderr, "tasks: id prio entry    arg      wait susp flags  cpu ms/tick\n");
+    int n = 0;
+    for (uint32_t t = RD32(0x758208); t && n < 256; t = RD32(t + 0x0c), n++) {
+        uint32_t h = RD32(t + 0x28);
+        uint64_t cpu = rt_thread_cpu_ns(h), &last = lastCpu[t ^ h];
+        double ms = last && cpu >= last ? (cpu - last) / 600.0 / 1e6 : 0;
+        last = cpu;
+        fprintf(stderr, "tasks: %02x  %02x  %08x %08x %4u %4u %02x  %6.3f%s\n", RD32(t + 4) & 0xff, MEM[t + 1], RD32(t + 0x24),
+                RD32(t + 0x1c), RD16(t + 8), RD16(t + 0x0a), MEM[t], ms, RD32(0x758204) == t ? "  (current)" : "");
+    }
+}
+
 NATIVE N_004075a0(void)
 {
     static int skipped;
@@ -637,7 +673,7 @@ NATIVE N_004074a0(void)
 #endif
             if (g_frameskipMax) { fprintf(stderr, "frameskip: %u of 600 frames skipped\n", g_framesSkipped); g_framesSkipped = 0; }
             fprintf(stderr, "t=%.0fs ticks %.1f/s clock %u | game %.2f render %.2f ms/tick | process cpu %.2f ms/tick %.2f Minstr/tick | game %.2f render %.2f Minstr/tick | loop ms avg/max: present %.2f/%.1f gil %.2f/%.1f delay %.2f/%.1f | presents %u, late %u, worst gap %.0f ms | mesh draws/frame %.0f, param blocks %.0f, all draws %.0f, pipeline binds %.0f | work/tick avg %.2f max %.2f ms | flushes/tick %.1f, "
-                    "upload %.0f KB/s (tex %u = %.0f KB/s, mesh %.0f, vertices %.0f) | textures %u (+%u -%u), meshes %u (+%u -%u), pipelines %u | heap %08x rss %llu MB\n",
+                    "upload %.0f KB/s (tex %u = %.0f KB/s, mesh %.0f, vertices %.0f) | textures %u (+%u -%u), meshes %u (+%u -%u), pipelines %u | heap %08x (live %.1f MB) virt %08x | rss %llu MB (guest %llu MB)\n",
                     TickMs() / 1000.0, 600e9 / (double)(now - since), RD32(0x717fc4),
                     (g_tickBusyNs - g_renderNs) / 600 / 1e6, g_renderNs / 600 / 1e6, ProcessCpuMsPerTick(), ProcessMInstrPerTick(), GameMInstrPerTick() - g_renderInstr / 600 / 1e6, g_renderInstr / 600 / 1e6,
                     g_phaseNs[0] / 600 / 1e6, g_phaseMaxNs[0] / 1e6, g_phaseNs[1] / 600 / 1e6, g_phaseMaxNs[1] / 1e6,
@@ -647,7 +683,9 @@ NATIVE N_004074a0(void)
                     g_tickBusyMaxNs / 1e6, gs.flushes / 600.0, gs.uploadBytes / 10.0 / 1024, gs.texUploads,
                     gs.texUploadBytes / 10.0 / 1024, gs.meshUploadBytes / 10.0 / 1024, gs.vertexBytes / 10.0 / 1024, gs.liveTextures,
                     gs.texCreates, gs.texDestroys, gs.liveMeshes, gs.meshCreates, gs.meshDestroys, gs.pipelines,
-                    rt_heap_top(), (unsigned long long)(mi.resident_size >> 20));
+                    rt_heap_top(), rt_heap_live() / 1048576.0, rt_virt_top(), (unsigned long long)(mi.resident_size >> 20),
+                    (unsigned long long)(rt_guest_rss_kb() >> 10));
+            if (CACHED_ENV("RECOMP_TRACE_TASKS")) TraceTasks();
             g_presents = g_presentsLate = 0; g_presentGapMaxNs = 0;
             memset(g_phaseNs, 0, sizeof(g_phaseNs)); memset(g_phaseMaxNs, 0, sizeof(g_phaseMaxNs));
             gs.meshDraws = gs.meshParamBlocks = gs.drawCmds = gs.pipelineBinds = 0;
@@ -685,6 +723,19 @@ NATIVE N_004074a0(void)
             }
         }
         g_tickCount++;
+        // test hook: RECOMP_SUSPEND_TASK=<entry hex>@<s>[,...] keeps the game task with that entry
+        // suspended (+0x0a, honoured by the scheduler 0x41ab70) from tick time s on
+        if (const char *st = CACHED_ENV("RECOMP_SUSPEND_TASK")) {
+            for (const char *p = st; *p;) {
+                uint32_t entry = (uint32_t)strtoul(p, (char **)&p, 16);
+                double from = *p == '@' ? strtod(p + 1, (char **)&p) : 0;
+                if (TickMs() / 1000.0 >= from)
+                    for (uint32_t t = RD32(0x758208), n = 0; t && n < 256; t = RD32(t + 0x0c), n++)
+                        if (RD32(t + 0x24) == entry) WR16(t + 0x0a, 1);
+                while (*p && *p != ',') p++;
+                if (*p == ',') p++;
+            }
+        }
 #ifdef RECOMP_GL
         uint64_t res0 = g_gfxResNs, cat0[6], wait0 = g_gfxWaitNs;
         memcpy(cat0, g_gfxResCatNs, sizeof(cat0));
@@ -903,6 +954,9 @@ static std::string ExePath(const std::string &dir)
 // point is passed to SDL (unless SDL_OPENGL_LIBRARY / SDL_EGL_LIBRARY are set).
 static void PickGLLibraries()
 {
+    // Desktop sessions (X11, Wayland) have consistent libraries, and SDL's X11 GLX path needs
+    // libGL, not libGLESv2: only the console (KMSDRM) handhelds need the choice below.
+    if ((getenv("DISPLAY") && *getenv("DISPLAY")) || (getenv("WAYLAND_DISPLAY") && *getenv("WAYLAND_DISPLAY"))) return;
     static const char *const dirs[] = {"", "/usr/lib/aarch64-linux-gnu/", "/usr/lib64/", "/usr/lib/",
                                        "/usr/local/lib/", "/usr/lib/mali/"};
     auto pick = [&](const char *hint, std::initializer_list<const char *> names, const char *symbol) {
