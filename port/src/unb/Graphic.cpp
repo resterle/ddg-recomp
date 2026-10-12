@@ -92,6 +92,7 @@ struct DrawCmd {
     SDL_Rect        scissor;
     CGraphicMesh   *pMesh;          // set for 3D model draws
     uint32_t        meshParams;     // index into Impl::meshParams
+    bool            copyTarget;     // samples the render target: copy it to pTargetCopy first
 };
 
 constexpr uint64_t kKeyMesh = 1ull << 24;
@@ -136,6 +137,7 @@ struct CGraphic::Impl {
     SDL_GPUTexture *pDepth = nullptr;
     SDL_GPUTexture *pWhite = nullptr;               // bound when drawing untextured
     SDL_GPUTexture *pPaletteAtlas = nullptr;
+    SDL_GPUTexture *pTargetCopy = nullptr;          // what a draw sampling its own target reads
     std::vector<uint8_t> paletteCPU;                // kPaletteAtlasW * kPaletteAtlasH * 4
     std::vector<uint32_t> dirtyPalettes;
     std::vector<bool> paletteDirty;
@@ -575,7 +577,16 @@ static bool Flush()
         do {
             bool mesh = i < n && g->draws[i].pMesh != nullptr;
             size_t e = i;
-            while (e < n && (g->draws[e].pMesh != nullptr) == mesh) e++;
+            while (e < n && (g->draws[e].pMesh != nullptr) == mesh && (e == i || !g->draws[e].copyTarget)) e++;
+            if (i < n && g->draws[i].copyTarget) {
+                // a draw sampling the target starts a new pass, after a copy of the target so far
+                SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+                SDL_GPUTextureLocation src = {}, dst = {};
+                src.texture = rt.pTex;
+                dst.texture = g->pTargetCopy;
+                SDL_CopyGPUTextureToTexture(copy, &src, &dst, rt.nWidth, rt.nHeight, 1, false);
+                SDL_EndGPUCopyPass(copy);
+            }
 
             SDL_GPUColorTargetInfo color = {};
             color.texture = rt.pTex;
@@ -679,6 +690,14 @@ static void FillTexture(DrawCmd &d)
         CGraphicTexture &t = *g->pCurTex;
         bool linear = s.magFilter == TEXF_LINEAR || s.minFilter == TEXF_LINEAR;
         d.pTex = t.pTex;
+        // The screen effect blends the scene into itself (texture slot 0 while rendering to slot 0,
+        // shifted by 1.5 lines). Sampling the target being drawn is undefined; Apple GPUs return
+        // garbage along 32-pixel tile rows (the magenta lines in the sky). Sample a copy taken
+        // right before the draw instead, which is what the original's D3D8 hardware showed.
+        if (&t == g->tex[g->target]) {
+            d.pTex = g->pTargetCopy;
+            d.copyTarget = true;
+        }
         d.pSampler = GetSampler(s.addrU, s.addrV, linear);
         d.fs.mode = t.nFormat == TEXFMT_P8 ? 2 : 1;
         d.fs.addrU = s.addrU;
@@ -898,10 +917,11 @@ bool CGraphic::Init(SDL_Window *window)
     g->tex[1] = MakeRenderTarget(w, h);
     if (!g->tex[0] || !g->tex[1]) return FAIL("render targets");
     g->pDepth = MakeGPUTexture(g->depthFormat, w, h, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
+    g->pTargetCopy = MakeGPUTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, w, h, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     g->pPaletteAtlas = MakeGPUTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, kPaletteAtlasW, kPaletteAtlasH,
                                       SDL_GPU_TEXTUREUSAGE_SAMPLER);
     CGraphicTexture *white = CreateTexture(1, 1, TEXFMT_BGRA8);
-    if (!g->pDepth || !g->pPaletteAtlas || !white) return FAIL("SDL_CreateGPUTexture");
+    if (!g->pDepth || !g->pTargetCopy || !g->pPaletteAtlas || !white) return FAIL("SDL_CreateGPUTexture");
     white->staging = {0xff, 0xff, 0xff, 0xff};
 
     // Upload the white texel and clear both scene targets.
@@ -948,7 +968,7 @@ void CGraphic::Term()
             if (s) SDL_ReleaseGPUShader(m_pDevice, s);
         for (CGraphicMesh *m : g->meshes) delete m;
         if (g->pMeshArena) SDL_ReleaseGPUBuffer(m_pDevice, g->pMeshArena);
-        for (SDL_GPUTexture *t : {g->pDepth, g->pWhite, g->pPaletteAtlas}) if (t) SDL_ReleaseGPUTexture(m_pDevice, t);
+        for (SDL_GPUTexture *t : {g->pDepth, g->pTargetCopy, g->pWhite, g->pPaletteAtlas}) if (t) SDL_ReleaseGPUTexture(m_pDevice, t);
         if (g->pVB) SDL_ReleaseGPUBuffer(m_pDevice, g->pVB);
         if (g->pUpload) SDL_ReleaseGPUTransferBuffer(m_pDevice, g->pUpload);
         if (g->pWindow) SDL_ReleaseWindowFromGPUDevice(m_pDevice, g->pWindow);

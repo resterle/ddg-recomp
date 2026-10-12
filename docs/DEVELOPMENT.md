@@ -750,13 +750,16 @@ Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SA
 
 ## 7. Known issues / next steps
 
-1. **Thin magenta/coloured 1-px lines** in the sky along rows that are multiples of 32
-   (Apple GPU tile rows). Reduced but not gone. Facts established: only diffuse meshes with the
-   sky texture are involved; raw texture sample is correct; the GPU texture copy is correct;
-   disappears when 2D draws 4/5 of the frame (full-screen black/grey clears with depth test,
-   z = far) are skipped. Suspect: depth interplay between those clears and the far sky
-   (precision at tile edges). Ideas: draw the sky with depth test off, or bias mesh depth,
-   or compare with a Vulkan run (MoltenVK) to rule out a Metal driver issue.
+1. **Thin magenta/coloured 1-px lines** in the sky along rows that are multiples of 32 (fixed
+   2026-10-13, SDL GPU renderer): the screen effect blends the scene into itself, a draw that
+   samples texture slot 0 while slot 0 is the render target (shifted by 1.5 lines, after the
+   draw that blends in the previous frame from slot 1). Reading the target being drawn is
+   undefined, and Apple GPUs returned garbage along their 32-pixel tile rows. Such draws now
+   start a new render pass after a copy of the target (`pTargetCopy`, `DrawCmd::copyTarget`)
+   and sample the copy. The earlier suspects (depth precision, far-plane clipping, implicit
+   LOD) were not the cause. `GraphicGL.cpp` had the same feedback loop (no visible artifact
+   with Apple's GL driver; undefined on tile-based Mali too): it now copies the bound FBO into
+   `targetCopy` with `glCopyTexSubImage2D` before such a draw and samples that.
 2. **Canvas and margins** (resolved by `crop`): the game draws its picture at (20,30)–(620,450)
    of the 640×480 layout and relies on TV overscan for the rest. The original stored the GS
    SCISSOR register but never applied it, so 3D spills into the margins while fades and cinema
