@@ -149,6 +149,37 @@ canvas at 4:3; `crop = 0` shows the whole 640×480 target including the overscan
 | `fullscreen` | 0 | Borderless fullscreen at start; **F11** or **Alt+Return** toggles |
 | `crop` | 1 | Show only the game's canvas (hide the overscan edges) |
 | `launcher` | 1 | Show the settings window at startup |
+| `texdump` | 0 | Write each new texture to `<settings>/texdump/ddg_<w>x<h>_<hash>.png` (SDL GPU, `texformat = 1`) |
+| `texpack` | 1 | Replace textures by the PNGs under `<settings>/textures/` whose names end in their hash |
+| `texpackmem` | 1024 | MB of decoded replacements kept for reuse (least recently used dropped first) |
+
+**Texture packs** (`port/src/unb/TexturePack.cpp`, SDL GPU renderer only): the key is a 64-bit
+hash of a texture's decoded BGRA texels and size, computed in `Flush` for each dirty texture
+(`ResolveReplacement`; nothing is hashed without a dump or a pack). A replacement of another
+size gets its own GPU texture (draws already recorded are re-pointed to it) with mip levels down
+to the original size, generated on the GPU; a full chain made alpha-tested lattices, wires and
+fences vanish at a distance. The fragment shaders sample with derivatives taken before the
+per-draw branch (`gradient2d` / `textureGrad`), so the mip level is defined; the game's own
+textures have one level and look as before. Dumps are encoded on a writer thread. Replacements are
+decoded on demand by worker threads: `Find` queues a missing one and returns nothing, the texture is
+uploaded as the original and listed in `packWaiting`, and `BeginFrame` uploads it again once
+decoded. The decoded copy is dropped after the upload; an LRU cache (`texpackmem`) keeps recent
+ones for scenery that is loaded again. With the full 4x pack (28,349 textures) a Yamanote Line
+drive peaks at 1.5 GB (0.43 GB without; 9.2 GB when the whole pack was decoded at start-up) with
+no slow ticks. `recomp/tools/texpack_bc7.py` (etcpak's BC7 encoder; its `compress_bc7` crashes
+without a params object, `decompress_bc7` crashes on Python 3.14) writes BC7 DDS files (DX10
+header, DXGI format 98) with the mip chain down to the original size, the last level from the
+extracted original. `LoadDDS` reads them without decoding, a DDS wins over a PNG of the same hash,
+and they are only used when `SDL_GPUTextureSupportsFormat` reports BC7 (Apple GPUs; lavapipe and
+desktop Vulkan drivers too). The same drive peaks at 0.75 GB; pack on disk 3.0 GB (PNG 2.1 GB). When the
+replacement is an exact power-of-two multiple of the original, the original texels are uploaded as
+its smallest mip level, after the generated ones (`OriginalAsLastMip`): an upscaler's smoothed grain
+does not reach distant scenery. `port/tools/texpack_extract` decodes every TXM record of cddata as
+`CTexture::LoadImage` does and names it by the same hash (28,290 textures; 774 of the 833 dumped
+in a Yamanote Line drive, the rest are composed at run time); `recomp/tools/texpack_upscale.py`
+upscales them with Real-ESRGAN (line-art model for interface folders, photo model mixed 30% with
+Lanczos for scenery, transparent texels filled from their neighbours first so the magenta under
+them does not bleed into edges). Checked on Metal and on Vulkan (lavapipe in Docker).
 
 DDGModernizer's patches (code fixes, aspect and draw distance sites) are applied when the exe is
 loaded (see "The exe" in section 1). The ten aspect instructions read their values from a settings page

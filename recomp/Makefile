@@ -43,7 +43,7 @@ TUNE       ?=
 GAME_SRC := $(wildcard build/game/*.c)
 GAME_OBJ := $(patsubst build/game/%.c,$(OBJ)/game/%.o,$(GAME_SRC))
 HOST_OBJ := $(OBJ)/host/runtime.o $(OBJ)/host/win32.o $(OBJ)/host/native.o $(OBJ)/host/launcher.o $(OBJ)/host/d3dx.o $(OBJ)/host/dsound.o
-PORT_SRC := $(GFX) Texture Gs Dma Vertex
+PORT_SRC := $(GFX) Texture TexturePack Gs Dma Vertex
 PORT_OBJ := $(patsubst %,$(OBJ)/port/%.o,$(PORT_SRC))
 
 $(TARGET): $(GAME_OBJ) $(HOST_OBJ) $(PORT_OBJ)

@@ -42,7 +42,7 @@ saves, keyboard and gamepad controls, correct game speed.
   [DDGModernizer](https://github.com/hunterbridges/DDGModernizer) works as well: its patches
   are applied by this project anyway, and its settings are options in `graphics.ini`.
 - To build: either **Docker** alone, or Python 3 with [capstone](https://www.capstone-engine.org/)
-  5.0, clang, make and SDL 3.2 or newer.
+  5.0, clang, make and SDL 3.4 or newer.
 
 The recompiled code is generated from your `perfect.exe`, and the game checks at startup that it
 runs with the same exe (it reads the game's tables and texts from it). Other versions, or an exe
@@ -141,6 +141,52 @@ patching anything:
 | `maxfps` | draw at most this many frames per second (30, 20, 15; 0 = 60). The game always runs at full speed |
 | `frameskip` | skip drawing up to n frames in a row when the machine falls behind, instead of slowing down |
 | `texformat` | 1 = 32-bit textures, 0 = paletted as the original |
+| `texdump`, `texpack` | write the game's textures out; load HD replacements (see below) |
+
+### HD textures (texture packs)
+
+With the SDL GPU renderer (macOS, Linux Vulkan) and `texformat = 1`, textures can be replaced by
+larger versions, for example made with an AI upscaler:
+
+1. Add `texdump = 1` to `graphics.ini` and play: every texture the game shows is written once to
+   the `texdump` folder next to `graphics.ini`, as `ddg_<width>x<height>_<hash>.png`.
+2. Upscale or edit those PNGs (any size; keep the aspect ratio and the alpha channel) and put them
+   into a `textures` folder next to `graphics.ini` (subfolders are fine). The name only has to
+   end in the 16-digit hash.
+3. Remove `texdump` again. Replacements are loaded in the background when the game first uses a
+   texture (the original shows for the few frames until then) and freed once on the GPU;
+   `texpackmem` (default 1024) is how many MB of them are kept for reuse. `texpack = 0` turns
+   them off.
+
+A texture is recognised by its content, so dumps made with another `texsize` do not match.
+
+Instead of playing everything with `texdump`, all of the game's textures (about 28,000; the HUD
+and text textures the game composes at run time still need a dump) can be extracted at once, and
+upscaled 4x with [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (`realesrgan-ncnn-vulkan`
+from its releases, about an hour on an Apple M-series GPU, about 5 GB):
+
+```sh
+cd port && make texpack_extract
+./texpack_extract "/path/to/game folder/cddata" /tmp/ddg-textures 2      # 2 = your texsize
+cd ../recomp && .venv/bin/pip install pillow numpy
+.venv/bin/python tools/texpack_upscale.py /tmp/ddg-textures \
+    "$HOME/Library/Application Support/TAITO/DengoFinal/textures/esrgan4x" \
+    --esrgan /path/to/realesrgan-ncnn-vulkan
+```
+
+Up close the upscaled textures are drawn; from a distance the game's own texels are (they are the
+smallest mip level), so far scenery looks as before.
+
+Optionally compress the pack to BC7 (DDS files with their mip levels): it then needs no decoding
+and takes a quarter of the memory on the GPU (a Yamanote Line drive peaked at 0.75 GB instead of
+1.5 GB). It is larger on disk than the PNGs (3.0 GB instead of 2.1 GB). DDS files win over PNGs
+of the same texture, so the PNG folder can be deleted afterwards; GPUs without BC7 use the PNGs.
+
+```sh
+.venv/bin/pip install etcpak
+.venv/bin/python tools/texpack_bc7.py "$HOME/Library/Application Support/TAITO/DengoFinal/textures/esrgan4x" \
+    "$HOME/Library/Application Support/TAITO/DengoFinal/textures/esrgan4x-bc7" --originals /tmp/ddg-textures
+```
 
 The OpenGL renderer has more switches (batching, mipmaps, texture stand-ins, an fps counter);
 they are listed in `recomp/linux/README.txt`.

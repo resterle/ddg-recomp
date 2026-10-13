@@ -22,6 +22,7 @@
 #include "GraphicShaders.h"
 #include "GraphicShadersSPV.h"     // the same shaders as SPIR-V (Vulkan), from shaders/scene.glsl
 #include "Texture.h"            // ps2:: decoders, shared with CTexture
+#include "TexturePack.h"        // texture dumping and HD replacements
 
 #include <algorithm>
 #include <mutex>
@@ -32,6 +33,7 @@
 #include <string>
 #include <unordered_map>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -103,6 +105,7 @@ constexpr uint32_t kPaletteAtlasH = CGraphic::kNoPalette / 16;
 } // namespace
 
 static uint32_t g_frameSerial;      // frames begun (debugging)
+static std::string g_prefDir;       // LoadConfig: settings folder (with a trailing /)
 static CGraphic::DebugStats g_stats; // diagnostics (RECOMP_TRACE_TICKS)
 
 struct CGraphicTexture {
@@ -113,6 +116,11 @@ struct CGraphicTexture {
     bool                 bRenderTarget = false;
     bool                 bDirty = false;
     std::vector<uint8_t> staging;                      // CPU copy filled through LockTexture
+    uint32_t             gpuW = 0, gpuH = 0, gpuLevels = 1;  // the GPU texture (a replacement's size)
+    bool                 gpuBC7 = false;               // ... holding a BC7 replacement
+    std::shared_ptr<const texpack::Image> repl;        // texture pack replacement, until uploaded
+    uint64_t             packHash = 0;                 // texels' hash, while waiting for the replacement
+    bool                 packWaiting = false;
 };
 
 // A model's vertices: a range of the shared mesh arena (one vertex buffer for all models, so a
@@ -148,6 +156,7 @@ struct CGraphic::Impl {
     std::vector<CGraphicTexture *> managedTex;      // CTexture table (nGroup 0x0F)
     std::vector<uint32_t> managedPalette;
     std::vector<CGraphicTexture *> dirtyTex;
+    std::vector<CGraphicTexture *> packWaiting;     // drawn as the original until the replacement is decoded
     std::vector<CGraphicMesh *> meshes, dirtyMeshes;
     SDL_GPUBuffer *pMeshArena = nullptr;
     uint32_t arenaCap = 0;                              // vertices
@@ -399,7 +408,9 @@ static SDL_GPUSampler *GetSampler(uint32_t addrU, uint32_t addrV, bool linear)
     };
     SDL_GPUSamplerCreateInfo si = {};
     si.min_filter = si.mag_filter = linear ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST;
-    si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    // only texture pack replacements have mip levels; the game's own textures have one
+    si.mipmap_mode = linear ? SDL_GPU_SAMPLERMIPMAPMODE_LINEAR : SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    si.max_lod = 1000.0f;
     si.address_mode_u = mode(addrU);
     si.address_mode_v = mode(addrV);
     si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
@@ -408,7 +419,8 @@ static SDL_GPUSampler *GetSampler(uint32_t addrU, uint32_t addrV, bool linear)
     return s;
 }
 
-static SDL_GPUTexture *MakeGPUTexture(SDL_GPUTextureFormat fmt, uint32_t w, uint32_t h, SDL_GPUTextureUsageFlags usage)
+static SDL_GPUTexture *MakeGPUTexture(SDL_GPUTextureFormat fmt, uint32_t w, uint32_t h, SDL_GPUTextureUsageFlags usage,
+                                      uint32_t levels = 1)
 {
     SDL_GPUTextureCreateInfo ti = {};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
@@ -417,7 +429,7 @@ static SDL_GPUTexture *MakeGPUTexture(SDL_GPUTextureFormat fmt, uint32_t w, uint
     ti.width = w;
     ti.height = h;
     ti.layer_count_or_depth = 1;
-    ti.num_levels = 1;
+    ti.num_levels = levels;
     ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
     return SDL_CreateGPUTexture(CGraphic::GetDevice(), &ti);
 }
@@ -444,6 +456,66 @@ static bool ReserveUpload(uint32_t size)
     return g->pUpload != nullptr;
 }
 
+// Texture packs: the replacement for a dirty texture's new texels (or none), with the GPU texture
+// resized to it. PNG replacements larger than the original get mip levels down to the original
+// size, generated on the GPU; BC7 ones bring their own. Draws recorded with the old GPU texture
+// are pointed at the new one.
+static void ResolveReplacement(CGraphicTexture *t)
+{
+    if (t->nFormat != TEXFMT_BGRA8 || t->bRenderTarget) return;
+    uint64_t hash = texpack::Hash(t->staging.data(), t->nWidth, t->nHeight);
+    texpack::Dump(hash, t->staging.data(), t->nWidth, t->nHeight);
+    std::shared_ptr<const texpack::Image> r = texpack::Find(hash);
+    // not decoded yet: the original texels for now, BeginFrame uploads again when it is ready
+    t->packHash = hash;
+    bool waiting = !r && texpack::Has(hash);
+    if (waiting && !t->packWaiting) g->packWaiting.push_back(t);
+    t->packWaiting = waiting;
+    // The mip chain ends at the original size: below it, averaged alpha fails the alpha tests
+    // (fences, wires and lattices thinned out or vanished), and the original drew level 0 there.
+    uint32_t w = r ? r->w : t->nWidth, h = r ? r->h : t->nHeight, levels = 1;
+    bool bc7 = r && r->bc7;
+    if (bc7) {
+        levels = r->levels;
+    } else {
+        uint32_t scale = SDL_max(1u, SDL_min(w / t->nWidth, h / t->nHeight));
+        while ((2u << (levels - 1)) <= scale) levels++;
+    }
+    if (w != t->gpuW || h != t->gpuH || levels != t->gpuLevels || bc7 != t->gpuBC7) {
+        SDL_GPUTextureUsageFlags usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | (levels > 1 && !bc7 ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0);
+        SDL_GPUTexture *nt = MakeGPUTexture(bc7 ? SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM : SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+                                            w, h, usage, levels);
+        if (!nt) {                                      // keep the texture as it is
+            SDL_Log("texture pack: cannot create a %ux%u texture: %s", w, h, SDL_GetError());
+            if (r && t->gpuW == t->nWidth && t->gpuH == t->nHeight) t->repl = nullptr;
+            return;
+        }
+        for (DrawCmd &d : g->draws) if (d.pTex == t->pTex) d.pTex = nt;
+        SDL_ReleaseGPUTexture(CGraphic::GetDevice(), t->pTex);
+        t->pTex = nt;
+        t->gpuW = w;
+        t->gpuH = h;
+        t->gpuLevels = levels;
+        t->gpuBC7 = bc7;
+    }
+    t->repl = r;
+}
+
+// A replacement an exact power-of-two multiple of the original gets the original texels as its
+// smallest mip level (after the generated ones): from a distance it looks exactly like the game's
+// texture, whose grain an upscaler may have smoothed away.
+static bool OriginalAsLastMip(const CGraphicTexture *t)
+{
+    uint32_t s = t->gpuLevels - 1;
+    return t->repl && !t->repl->bc7 && s && t->gpuW == t->nWidth << s && t->gpuH == t->nHeight << s;
+}
+
+static uint32_t UploadBytes(const CGraphicTexture *t)
+{
+    return t->repl ? (uint32_t)(t->repl->data.size() + (OriginalAsLastMip(t) ? t->staging.size() : 0))
+                   : (uint32_t)t->staging.size();
+}
+
 // Submit everything recorded so far: texture/palette uploads, then the batched draws.
 static void ArenaRelease(uint32_t offset, uint32_t count);
 
@@ -454,7 +526,8 @@ static bool Flush()
 
     uint32_t vbytes = (uint32_t)(g->verts.size() * sizeof(Vertex));
     uint32_t uploadSize = vbytes;
-    for (CGraphicTexture *t : g->dirtyTex) uploadSize += (uint32_t)t->staging.size();
+    if (texpack::Active()) for (CGraphicTexture *t : g->dirtyTex) ResolveReplacement(t);
+    for (CGraphicTexture *t : g->dirtyTex) uploadSize += UploadBytes(t);
     for (CGraphicMesh *m : g->dirtyMeshes) uploadSize += (uint32_t)(m->staging.size() * sizeof(MeshVertex));
     uploadSize += (uint32_t)g->dirtyPalettes.size() * 256 * 4;
     uint32_t nParams = (uint32_t)g->meshParams.size();
@@ -484,7 +557,7 @@ static bool Flush()
     }
     g_stats.uploadBytes += uploadSize;
     g_stats.vertexBytes += vbytes;
-    for (CGraphicTexture *t : g->dirtyTex) { g_stats.texUploads++; g_stats.texUploadBytes += (uint32_t)t->staging.size(); }
+    for (CGraphicTexture *t : g->dirtyTex) { g_stats.texUploads++; g_stats.texUploadBytes += UploadBytes(t); }
     for (CGraphicMesh *m : g->dirtyMeshes) g_stats.meshUploadBytes += (uint32_t)(m->staging.size() * sizeof(MeshVertex));
 
     if (vbytes > g->vbCapacity) {
@@ -502,6 +575,8 @@ static bool Flush()
         if (!ReserveUpload(uploadSize)) { SDL_CancelGPUCommandBuffer(cmd); return FAIL("SDL_CreateGPUTransferBuffer"); }
         uint8_t *map = static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, g->pUpload, true));
         uint32_t off = 0;
+        std::vector<SDL_GPUTexture *> mipmapped;        // replacements: mip chain after the uploads
+        std::vector<std::pair<CGraphicTexture *, uint32_t>> lastMips;  // and the original texels as the last
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
 
         if (vbytes) {
@@ -512,13 +587,36 @@ static bool Flush()
             off += vbytes;
         }
         for (CGraphicTexture *t : g->dirtyTex) {
-            memcpy(map + off, t->staging.data(), t->staging.size());
-            SDL_GPUTextureTransferInfo src = {g->pUpload, off, t->nWidth, t->nHeight};
-            SDL_GPUTextureRegion dst = {};
-            dst.texture = t->pTex; dst.w = t->nWidth; dst.h = t->nHeight; dst.d = 1;
-            SDL_UploadToGPUTexture(copy, &src, &dst, false);
-            off += (uint32_t)t->staging.size();
             t->bDirty = false;
+            if (t->repl && t->repl->bc7) {              // all mip levels, as compressed in the file
+                const texpack::Image &r = *t->repl;
+                memcpy(map + off, r.data.data(), r.data.size());
+                for (uint32_t l = 0, lo = off; l < r.levels; lo += texpack::BC7LevelSize(r.w, r.h, l), l++) {
+                    SDL_GPUTextureTransferInfo src = {g->pUpload, lo, 0, 0};
+                    SDL_GPUTextureRegion dst = {};
+                    dst.texture = t->pTex; dst.mip_level = l; dst.d = 1;
+                    dst.w = SDL_max(r.w >> l, 1u); dst.h = SDL_max(r.h >> l, 1u);
+                    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+                }
+                off += (uint32_t)r.data.size();
+                t->repl.reset();
+                continue;
+            }
+            const uint8_t *data = t->repl ? t->repl->data.data() : t->staging.data();
+            uint32_t bytes = t->repl ? (uint32_t)t->repl->data.size() : (uint32_t)t->staging.size();
+            memcpy(map + off, data, bytes);
+            SDL_GPUTextureTransferInfo src = {g->pUpload, off, t->gpuW, t->gpuH};
+            SDL_GPUTextureRegion dst = {};
+            dst.texture = t->pTex; dst.w = t->gpuW; dst.h = t->gpuH; dst.d = 1;
+            SDL_UploadToGPUTexture(copy, &src, &dst, false);
+            off += bytes;
+            if (t->gpuLevels > 1) mipmapped.push_back(t->pTex);
+            if (OriginalAsLastMip(t)) {
+                memcpy(map + off, t->staging.data(), t->staging.size());
+                lastMips.push_back({t, off});
+                off += (uint32_t)t->staging.size();
+            }
+            t->repl.reset();                            // the GPU has it; the pack's cache may keep it
         }
         g->dirtyTex.clear();
         for (CGraphicMesh *m : g->dirtyMeshes) {
@@ -559,6 +657,18 @@ static bool Flush()
         }
         SDL_EndGPUCopyPass(copy);
         SDL_UnmapGPUTransferBuffer(dev, g->pUpload);
+        for (SDL_GPUTexture *t : mipmapped) SDL_GenerateMipmapsForGPUTexture(cmd, t);
+        if (!lastMips.empty()) {
+            SDL_GPUCopyPass *mipCopy = SDL_BeginGPUCopyPass(cmd);
+            for (auto &lm : lastMips) {
+                CGraphicTexture *t = lm.first;
+                SDL_GPUTextureTransferInfo src = {g->pUpload, lm.second, t->nWidth, t->nHeight};
+                SDL_GPUTextureRegion dst = {};
+                dst.texture = t->pTex; dst.mip_level = t->gpuLevels - 1; dst.w = t->nWidth; dst.h = t->nHeight; dst.d = 1;
+                SDL_UploadToGPUTexture(mipCopy, &src, &dst, false);
+            }
+            SDL_EndGPUCopyPass(mipCopy);
+        }
     }
 
     if (haveWork) {
@@ -810,6 +920,7 @@ bool CGraphic::LoadConfig(int argc, char **argv)
     const char *override = getenv("RECOMP_PREF_DIR");
     char *pref = override ? SDL_strdup((std::string(override) + "/").c_str()) : SDL_GetPrefPath("TAITO", "DengoFinal");
     if (pref) {
+        g_prefDir = pref;
         std::string path = std::string(pref) + "graphics.ini";
         SDL_free(pref);
         if (FILE *f = fopen(path.c_str(), "r")) {
@@ -819,7 +930,8 @@ bool CGraphic::LoadConfig(int argc, char **argv)
                 {"refrate", &m_Config.refrate}, {"zformat", &m_Config.zformat}, {"texformat", &m_Config.texformat},
                 {"texmodulate", &m_Config.texmodulate}, {"fog", &m_Config.fog}, {"texsize", &m_Config.texsize},
                 {"screffect", &m_Config.screffect}, {"snapshot", &m_Config.snapshot},
-                {"crop", &m_Config.crop},
+                {"crop", &m_Config.crop}, {"texdump", &m_Config.texdump}, {"texpack", &m_Config.texpack},
+                {"texpackmem", &m_Config.texpackmem},
             };
             char line[256];
             while (fgets(line, sizeof(line), f)) {
@@ -859,6 +971,15 @@ bool CGraphic::Init(SDL_Window *window)
     if (!m_Config.windowed) SDL_SetWindowFullscreen(window, true);
 
     m_nTexFormat = m_Config.texformat == 0 ? TEXFMT_P8 : TEXFMT_BGRA8;
+    // texture packs work on BGRA texels (with P8 the palette is applied on the GPU)
+    if (m_nTexFormat == TEXFMT_BGRA8) {
+        // compressed (DDS) replacements need BC7 (Apple GPUs, desktop Vulkan); PNGs work everywhere
+        bool bc7 = SDL_GPUTextureSupportsFormat(m_pDevice, SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM, SDL_GPU_TEXTURETYPE_2D,
+                                                SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        texpack::Init(g_prefDir, m_Config.texdump != 0, m_Config.texpack != 0, (uint32_t)SDL_max(m_Config.texpackmem, 0), bc7);
+    }
+    else if (m_Config.texdump)
+        SDL_Log("texture dumps and packs need texformat = 1 (32-bit textures)");
     static const uint32_t sizes[4] = {256, 512, 1024, 1024};
     g->maxTexW = g->maxTexH = sizes[SDL_clamp(m_Config.texsize, 0, 3)];
     // Original default: MODULATE2X unless texmodulate == 2 (PS2 vertex colours use 0x80 as 1.0).
@@ -947,6 +1068,7 @@ bool CGraphic::Init(SDL_Window *window)
 
 void CGraphic::Term()
 {
+    texpack::Term();
     if (!g) return;
     if (m_pDevice) {
         SDL_WaitForGPUIdle(m_pDevice);
@@ -992,6 +1114,14 @@ void CGraphic::HoldRecordingLock(bool) {}
 bool CGraphic::BeginFrame()
 {
     g_frameSerial++;
+    // texture pack replacements decoded since the last frame: upload them in place of the originals
+    for (size_t i = 0; i < g->packWaiting.size();) {
+        CGraphicTexture *t = g->packWaiting[i];
+        if (t->packWaiting && !texpack::Find(t->packHash)) { i++; continue; }
+        if (t->packWaiting) { t->packWaiting = false; MarkDirty(t); }
+        g->packWaiting[i] = g->packWaiting.back();
+        g->packWaiting.pop_back();
+    }
     // Original: BeginScene, then render into texture slot 0 (screffect) or clear the letterbox
     // borders, then SetViewport(2, TRUE) to re-apply the current viewport.
     if (!SetRenderTargetTexture(0)) return false;
@@ -1110,6 +1240,8 @@ CGraphicTexture *CGraphic::CreateTexture(uint32_t nWidth, uint32_t nHeight, TexF
                              t->nWidth, t->nHeight, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     if (!t->pTex) { delete t; FAIL("SDL_CreateGPUTexture"); return nullptr; }
     t->staging.assign((size_t)t->nWidth * t->nHeight * BytesPerTexel(fmt), 0);
+    t->gpuW = t->nWidth;
+    t->gpuH = t->nHeight;
     MarkDirty(t);
     g_stats.liveTextures++; g_stats.texCreates++;
     return t;
@@ -1120,6 +1252,8 @@ void CGraphic::DestroyTexture(CGraphicTexture *pTex)
     if (!pTex) return;
     Flush();                                            // recorded draws may still use it
     g->dirtyTex.erase(std::remove(g->dirtyTex.begin(), g->dirtyTex.end(), pTex), g->dirtyTex.end());
+    if (pTex->packWaiting)
+        g->packWaiting.erase(std::remove(g->packWaiting.begin(), g->packWaiting.end(), pTex), g->packWaiting.end());
     if (g->pCurTex == pTex) g->pCurTex = nullptr;
     for (auto &p : g->managedTex) if (p == pTex) p = nullptr;
     for (auto &p : g->tex) if (p == pTex) p = nullptr;
@@ -1697,6 +1831,8 @@ bool CGraphic::DrawMesh(CGraphicMesh *pMesh, MeshShader shader, PrimitiveType ty
 int CGraphic::DebugCompareManagedTexture(uint32_t nHandle, const char *prefix)
 {
     if (nHandle >= kMaxTextures || !g->managedTex[nHandle]) return -1;
+    CGraphicTexture *mt = g->managedTex[nHandle];
+    if (mt->gpuW != mt->nWidth || mt->gpuH != mt->nHeight) return -1;   // the GPU holds a replacement
     std::lock_guard<std::recursive_mutex> lock(g->gpuLock);
     Flush();
     CGraphicTexture &t = *g->managedTex[nHandle];
