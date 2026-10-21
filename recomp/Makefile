@@ -19,10 +19,12 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS   := $(shell pkg-config --libs sdl3)
 endif
 OPT        ?= -O2
-# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000; Linux
-# kernels with 39-bit address spaces (common on ARM handhelds) end at 0x8000000000.
+# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000 and puts
+# malloc's regions at random places in 0x7000000000-0x8000000000 before main runs (sometimes over a
+# base there), so it goes to 1 TB; Linux kernels with 39-bit address spaces (common on ARM
+# handhelds) end at 0x8000000000.
 ifeq ($(shell uname -s),Darwin)
-MEMBASE    ?= 0x8000000000
+MEMBASE    ?= 0x10000000000
 else
 MEMBASE    ?= 0x400000000
 endif

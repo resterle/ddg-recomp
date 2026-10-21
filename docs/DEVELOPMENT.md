@@ -259,8 +259,10 @@ inside the arm64 image would run under qemu; the cross build takes about a minut
   appended to the previous draw (`lastStrip`, strip ranges in `stripRuns`); sorting uses a
   precomputed (pipeline key, hash) per draw, with an exact comparison before merging.
 - **Guest memory on macOS:** `rt_reserve_guest_memory()` runs first thing in `main`. Apple's GPU
-  driver reserves ~12 GB at a random address once a window exists, and sometimes covered the
-  fixed base (0x8000000000); that was the intermittent "cannot reserve the emulated memory".
+  driver reserves ~12 GB at a random address once a window exists. The base is 0x10000000000:
+  before `main`, malloc reserves a ~12 GB region at a random place in 0x7000000000–0x8000000000,
+  which covered the former base 0x8000000000 (alias from 0x7f00000000) in about one launch in ten
+  ("guest memory: mach_vm_allocate at 7f00000000 failed").
 - **VU0 intrinsics:** 0x415740/0x415760/0x415700/0x415810 are expanded inline by the translator
   (`x86lift.INTRINSICS`, helpers `rt_vu0_apply`/`rt_vu0_mul` in `host/d3dx.cpp`) instead of going
   through the native boundary. They are called from the game's inner loops.
@@ -774,9 +776,10 @@ Macros: `RT_CALL`, `RT_RET`, `RT_RET_FROM_R`.
 The guest memory is mapped twice, the 4 GB at `MEM` and the same pages again in the 4 GB below,
 which makes every result in [−4 GB, 4 GB) identical to x86's 32-bit wrap-around. `esp` is a
 signed local, so consecutive pushes share one base register (paired stores). `lea` keeps exact
-32-bit arithmetic. `MEMBASE` must leave room for the alias below it (macOS: ≥ 0x7000000000 + 4 GB).
+32-bit arithmetic. `MEMBASE` must leave room for the alias below it, and on macOS the alias must stay clear of
+malloc's 0x7000000000–0x8000000000 (default 0x10000000000).
 
-Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SAVES"`
+Count translated calls with `make DEFS="-DRT_MEM_BASE=0x10000000000 -DRT_COUNT_SAVES"`
 (~46,000 per frame at the benchmark point).
 
 ## 7. Known issues / next steps
