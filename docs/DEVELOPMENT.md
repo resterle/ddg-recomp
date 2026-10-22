@@ -150,6 +150,37 @@ canvas at 4:3; `crop = 0` shows the whole 640×480 target including the overscan
 | `fullscreen` | 0 | Borderless fullscreen at start; **F11** or **Alt+Return** toggles |
 | `crop` | 1 | Show only the game's canvas (hide the overscan edges) |
 | `launcher` | 1 | Show the settings window at startup |
+| `texdump` | 0 | Write each new texture to `<settings>/texdump/ddg_<w>x<h>_<hash>.png` (SDL GPU, `texformat = 1`) |
+| `texpack` | 1 | Replace textures by the PNGs under `<settings>/textures/` whose names end in their hash |
+| `texpackmem` | 1024 | MB of decoded replacements kept for reuse (least recently used dropped first) |
+
+**Texture packs** (`port/src/unb/TexturePack.cpp`, SDL GPU renderer only): the key is a 64-bit
+hash of a texture's decoded BGRA texels and size, computed in `Flush` for each dirty texture
+(`ResolveReplacement`; nothing is hashed without a dump or a pack). A replacement of another
+size gets its own GPU texture (draws already recorded are re-pointed to it) with mip levels down
+to the original size, generated on the GPU; a full chain made alpha-tested lattices, wires and
+fences vanish at a distance. The fragment shaders sample with derivatives taken before the
+per-draw branch (`gradient2d` / `textureGrad`), so the mip level is defined; the game's own
+textures have one level and look as before. Dumps are encoded on a writer thread. Replacements are
+decoded on demand by worker threads: `Find` queues a missing one and returns nothing, the texture is
+uploaded as the original and listed in `packWaiting`, and `BeginFrame` uploads it again once
+decoded. The decoded copy is dropped after the upload; an LRU cache (`texpackmem`) keeps recent
+ones for scenery that is loaded again. With the full 4x pack (28,349 textures) a Yamanote Line
+drive peaks at 1.5 GB (0.43 GB without; 9.2 GB when the whole pack was decoded at start-up) with
+no slow ticks. `recomp/tools/texpack_bc7.py` (etcpak's BC7 encoder; its `compress_bc7` crashes
+without a params object, `decompress_bc7` crashes on Python 3.14) writes BC7 DDS files (DX10
+header, DXGI format 98) with the mip chain down to the original size, the last level from the
+extracted original. `LoadDDS` reads them without decoding, a DDS wins over a PNG of the same hash,
+and they are only used when `SDL_GPUTextureSupportsFormat` reports BC7 (Apple GPUs; lavapipe and
+desktop Vulkan drivers too). The same drive peaks at 0.75 GB; pack on disk 3.0 GB (PNG 2.1 GB). When the
+replacement is an exact power-of-two multiple of the original, the original texels are uploaded as
+its smallest mip level, after the generated ones (`OriginalAsLastMip`): an upscaler's smoothed grain
+does not reach distant scenery. `port/tools/texpack_extract` decodes every TXM record of cddata as
+`CTexture::LoadImage` does and names it by the same hash (28,290 textures; 774 of the 833 dumped
+in a Yamanote Line drive, the rest are composed at run time); `recomp/tools/texpack_upscale.py`
+upscales them with Real-ESRGAN (line-art model for interface folders, photo model mixed 30% with
+Lanczos for scenery, transparent texels filled from their neighbours first so the magenta under
+them does not bleed into edges). Checked on Metal and on Vulkan (lavapipe in Docker).
 
 DDGModernizer's patches (code fixes, aspect and draw distance sites) are applied when the exe is
 loaded (see "The exe" in section 1). The ten aspect instructions read their values from a settings page
@@ -229,8 +260,10 @@ inside the arm64 image would run under qemu; the cross build takes about a minut
   appended to the previous draw (`lastStrip`, strip ranges in `stripRuns`); sorting uses a
   precomputed (pipeline key, hash) per draw, with an exact comparison before merging.
 - **Guest memory on macOS:** `rt_reserve_guest_memory()` runs first thing in `main`. Apple's GPU
-  driver reserves ~12 GB at a random address once a window exists, and sometimes covered the
-  fixed base (0x8000000000); that was the intermittent "cannot reserve the emulated memory".
+  driver reserves ~12 GB at a random address once a window exists. The base is 0x10000000000:
+  before `main`, malloc reserves a ~12 GB region at a random place in 0x7000000000–0x8000000000,
+  which covered the former base 0x8000000000 (alias from 0x7f00000000) in about one launch in ten
+  ("guest memory: mach_vm_allocate at 7f00000000 failed").
 - **VU0 intrinsics:** 0x415740/0x415760/0x415700/0x415810 are expanded inline by the translator
   (`x86lift.INTRINSICS`, helpers `rt_vu0_apply`/`rt_vu0_mul` in `host/d3dx.cpp`) instead of going
   through the native boundary. They are called from the game's inner loops.
@@ -1044,20 +1077,24 @@ Macros: `RT_CALL`, `RT_RET`, `RT_RET_FROM_R`.
 The guest memory is mapped twice, the 4 GB at `MEM` and the same pages again in the 4 GB below,
 which makes every result in [−4 GB, 4 GB) identical to x86's 32-bit wrap-around. `esp` is a
 signed local, so consecutive pushes share one base register (paired stores). `lea` keeps exact
-32-bit arithmetic. `MEMBASE` must leave room for the alias below it (macOS: ≥ 0x7000000000 + 4 GB).
+32-bit arithmetic. `MEMBASE` must leave room for the alias below it, and on macOS the alias must stay clear of
+malloc's 0x7000000000–0x8000000000 (default 0x10000000000).
 
-Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SAVES"`
+Count translated calls with `make DEFS="-DRT_MEM_BASE=0x10000000000 -DRT_COUNT_SAVES"`
 (~46,000 per frame at the benchmark point).
 
 ## 7. Known issues / next steps
 
-1. **Thin magenta/coloured 1-px lines** in the sky along rows that are multiples of 32
-   (Apple GPU tile rows). Reduced but not gone. Facts established: only diffuse meshes with the
-   sky texture are involved; raw texture sample is correct; the GPU texture copy is correct;
-   disappears when 2D draws 4/5 of the frame (full-screen black/grey clears with depth test,
-   z = far) are skipped. Suspect: depth interplay between those clears and the far sky
-   (precision at tile edges). Ideas: draw the sky with depth test off, or bias mesh depth,
-   or compare with a Vulkan run (MoltenVK) to rule out a Metal driver issue.
+1. **Thin magenta/coloured 1-px lines** in the sky along rows that are multiples of 32 (fixed
+   2026-10-13, SDL GPU renderer): the screen effect blends the scene into itself, a draw that
+   samples texture slot 0 while slot 0 is the render target (shifted by 1.5 lines, after the
+   draw that blends in the previous frame from slot 1). Reading the target being drawn is
+   undefined, and Apple GPUs returned garbage along their 32-pixel tile rows. Such draws now
+   start a new render pass after a copy of the target (`pTargetCopy`, `DrawCmd::copyTarget`)
+   and sample the copy. The earlier suspects (depth precision, far-plane clipping, implicit
+   LOD) were not the cause. `GraphicGL.cpp` had the same feedback loop (no visible artifact
+   with Apple's GL driver; undefined on tile-based Mali too): it now copies the bound FBO into
+   `targetCopy` with `glCopyTexSubImage2D` before such a draw and samples that.
 2. **Canvas and margins** (resolved by `crop`): the game draws its picture at (20,30)–(620,450)
    of the 640×480 layout and relies on TV overscan for the rest. The original stored the GS
    SCISSOR register but never applied it, so 3D spills into the margins while fades and cinema

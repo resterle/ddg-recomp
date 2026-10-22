@@ -19,10 +19,12 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS   := $(shell pkg-config --libs sdl3)
 endif
 OPT        ?= -O2
-# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000; Linux
-# kernels with 39-bit address spaces (common on ARM handhelds) end at 0x8000000000.
+# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000 and puts
+# malloc's regions at random places in 0x7000000000-0x8000000000 before main runs (sometimes over a
+# base there), so it goes to 1 TB; Linux kernels with 39-bit address spaces (common on ARM
+# handhelds) end at 0x8000000000.
 ifeq ($(shell uname -s),Darwin)
-MEMBASE    ?= 0x8000000000
+MEMBASE    ?= 0x10000000000
 else
 MEMBASE    ?= 0x400000000
 endif
@@ -43,7 +45,7 @@ TUNE       ?=
 GAME_SRC := $(wildcard build/game/*.c)
 GAME_OBJ := $(patsubst build/game/%.c,$(OBJ)/game/%.o,$(GAME_SRC))
 HOST_OBJ := $(OBJ)/host/runtime.o $(OBJ)/host/win32.o $(OBJ)/host/native.o $(OBJ)/host/launcher.o $(OBJ)/host/overlay.o $(OBJ)/host/d3dx.o $(OBJ)/host/dsound.o $(OBJ)/host/tasks.o
-PORT_SRC := $(GFX) Texture Gs Dma Vertex
+PORT_SRC := $(GFX) Texture TexturePack Gs Dma Vertex
 # RECOMP_JIT=1: the program without the game code. On the first start with an exe it translates
 # it with the built-in Python (host/pyembed.cpp), compiles the C with the built-in clang/LLVM and
 # runs it with LLVM's JIT, caching both (host/jit.cpp; prototype). LLVM_CONFIG: the LLVM to build
