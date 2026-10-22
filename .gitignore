@@ -1,6 +1,7 @@
 # --- Never publish: game files and code derived from them -------------------------------------
 # The game itself (bring your own copy)
 *.exe
+*.iso
 cddata/
 # Ghidra project and its exports: decompiled game code, reconstructed headers, analysis dumps
 proj/

@@ -23,6 +23,7 @@
 #include "Graphic.h"
 #include "Texture.h"
 #include <cstdint>
+#include <map>
 #include <vector>
 
 class CVertex : public IVu1Handler {
@@ -47,6 +48,10 @@ public:
     static uint8_t *PacketBlock(uint8_t *pModel);
     static uint32_t PacketBlockSize(uint8_t *pModel);
 
+    // Whether [p, p + n) lies inside a registered model's packet block: data that only changes
+    // when models are (un)registered (the asynchronous DMA thread reads it in place).
+    bool InModelPackets(const uint8_t *p, size_t n) const;
+
     // IVu1Handler (called by CDma's VIF1 interpreter)
     void Unpack(uint32_t vifcode, const uint8_t *data, size_t bytes) override;
     void Run() override;
@@ -66,6 +71,7 @@ private:
     void Object(const uint8_t *data);
 
     std::vector<Model> m_Models;
+    std::map<const uint8_t *, const uint8_t *> m_Blocks;     // registered packet blocks: start -> end
     MeshConstants m_Const = {};
     float m_WorldToScreen[4][4] = {};
     const uint8_t *m_pCamera = nullptr;     // DAT_00673068 + 0x10

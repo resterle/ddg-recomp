@@ -18,8 +18,13 @@ Controls (keyboard keys in brackets)
   X                    [Space]
   L1 / R1              [Page Up / Page Down]
   L2 / R2              [Home / End]
+  Y                    options menu (resolution, draw distance, frame rate, fps counter) [F10]
   Start + Select       quit
   R3 (right stick)     screenshot (ddg-recomp/snapshot/)
+
+Options menu (Y, or F10 on a keyboard): up/down select, left/right change, B closes. Changes
+apply at once (a new resolution after a restart) and are saved to graphics.ini. The game keeps
+running while the menu is open but gets no input.
 
 Files
   ddg-recomp/conf/graphics.ini   settings (draw distance, aspect, texture format, ...)
@@ -32,12 +37,18 @@ Renderer: OpenGL ES 3.0 (Mali-G31). Sound through ALSA.
 Speed settings (ddg-recomp/conf/graphics.ini)
   frameskip = 3        skip drawing up to 3 frames in a row when the device falls behind, so the
                        game keeps full speed (0 = draw every frame, slow motion when too slow)
-  drawdistance = 0.40  scenery distance (the PC original used 0.9; higher costs speed)
+  drawdistance = auto  scenery distance: auto = the game's own controller, steered by how busy
+                       the device is (it draws further while there is time to spare); a number
+                       fixes it (0.9 draws about twice as much as 0.45: slower); original = the
+                       game's controller as in the PC original (0.45 always)
+  ddmax = 1.0          auto: the largest draw distance (ddmin = 0.45 the smallest; ddload = 0.80
+                       the share of each frame's time it aims for)
   standins = 1         new scenery textures that are not uploaded yet are drawn blurred (or, with
                        transparency, not at all) for a few frames; 0 = wait (short freezes)
   maxfps = 0           draw at most this many frames per second (30, 20 or 15; 0 = 60). The game
-                       still runs at full speed. On the R36H, driving with drawdistance = 0.90
-                       runs at about 60 (with vsync = 0); maxfps = 30 saves heat and battery
+                       still runs at full speed. On the R36H with drawdistance = auto, maxfps = 30
+                       draws the full distance (1.0) nearly everywhere; at 60 the distance varies
+                       (0.45-0.9) and the frame rate stays at about 59
   texformat = 1        32-bit textures (0 = paletted: less memory but much slower on this GPU)
   batching = 1         sort and merge model draws (far fewer draw calls)
   fastalpha = 1        skip blending where it cannot change a pixel (harder edges on foliage)

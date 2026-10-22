@@ -28,10 +28,11 @@ saves, keyboard and gamepad controls, correct game speed.
   positioning (unused on PC).
 - 118 functions (MMX/SSE/3DNow! paths of the D3DX maths library) are not translated. None has
   been reached in play so far; reaching one stops the game with a message naming its address.
-- On the R36H (RK3326, 4× Cortex-A35 at 1.5 GHz, Mali-G31), driving on the Yamanote Line with
-  the PC's draw distance (0.9) runs at about 60 frames/s (`maxfps = 0`, `vsync = 0`), or a
-  steady 30 with `maxfps = 30` (less heat and battery use). The shipped handheld settings use
-  draw distance 0.4.
+- On the R36H (RK3326, 4× Cortex-A35 at 1.5 GHz, Mali-G31), driving with `maxfps = 30` and
+  `drawdistance = auto` shows the full draw distance (1.0, every overhead-line gantry) at a steady
+  30 frames/s; at 60 frames/s (`maxfps = 0`) auto keeps about 59 with a distance of 0.45-0.9.
+- An options menu over the game (Y on a gamepad, F10) changes the draw distance, frame rate and
+  fps counter while playing, and the resolution for the next start.
 
 ## What you need
 
@@ -41,12 +42,44 @@ saves, keyboard and gamepad controls, correct game speed.
   driver is disabled there). A copy patched by
   [DDGModernizer](https://github.com/hunterbridges/DDGModernizer) works as well: its patches
   are applied by this project anyway, and its settings are options in `graphics.ini`.
-- To build: either **Docker** alone, or Python 3 with [capstone](https://www.capstone-engine.org/)
-  5.0, clang, make and SDL 3.2 or newer.
+- To build: the **builder** (nothing else to install), or **Docker** alone, or Python 3 with
+  [capstone](https://www.capstone-engine.org/) 5.0, clang, make and SDL 3.2 or newer.
 
 The recompiled code is generated from your `perfect.exe`, and the game checks at startup that it
 runs with the same exe (it reads the game's tables and texts from it). Other versions, or an exe
 with a translation patch, need their own build.
+
+## Ready-made programs (Linux, macOS)
+
+The [releases](https://github.com/resterle/ddg-recomp/releases) have programs that contain no part
+of the game: on the first start they translate your `perfect.exe` and compile it for your
+computer with a built-in translator and compiler (one to two minutes, once; a settings window
+shows the progress, and you can choose the game folder, the exe and the settings meanwhile).
+They are built by `.github/workflows/release.yml` (`make RECOMP_JIT=1`, see
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) §3l). Linux x86-64 needs glibc 2.35 or newer; the
+macOS build (Apple Silicon) is new and not yet tested on a Mac. The ARM handhelds still need one
+of the builds below.
+
+## Building with the builder
+
+The builder is a download that contains everything needed to build except the game: a portable
+Python with the translator, the [zig](https://ziglang.org/) toolchain (clang and lld for every
+target) and the project's own code, already compiled. It translates your `perfect.exe`, compiles
+the result for the target and packs the same package as the builds below, in one to two minutes.
+
+```sh
+./ddg-builder handheld /path/to/perfect.exe      # -> ddg-recomp-arm64.zip (R36H/R36S, ArkOS-style)
+./ddg-builder desktop  /path/to/perfect.exe      # -> ddg-recomp-linux-x64.tar.gz (x86-64 Linux)
+```
+
+On Windows, drag `perfect.exe` onto `ddg-builder.bat` (handheld package). The builder runs on
+x86-64 Linux and Windows; macOS and arm64 Linux builders can be made the same way but are
+untested.
+
+The builder itself is made with `recomp/builder/make-kit.py [linux-x64] [windows-x64] ...` on an
+x86-64 Linux machine with Docker (for the SDL3 builds); it writes
+`recomp/build/kit/ddg-recomp-builder-<host>.(tar.xz|zip)`. It contains no game code and may be
+shared; the packages it builds may not.
 
 ## Building with Docker
 
@@ -125,6 +158,7 @@ installation, controls and the speed settings.
 | Space | X | advance tutorial text |
 | Page Up / Page Down | L1 / R1 | |
 | Home / End | L2 / R2 | |
+| F10 | Y | options menu (resolution, draw distance, frame rate, fps counter) |
 | | Start + Back | quit |
 
 ### Settings (`graphics.ini`)
@@ -136,7 +170,7 @@ patching anything:
 |---|---|
 | `scrwidth`, `scrheight` | render size; a wider size gives widescreen |
 | `aspect` | 3D aspect (`auto` follows the render size) |
-| `drawdistance` | scenery distance (0.9 is the PC original) |
+| `drawdistance` | `auto` (default): the game's own scenery controller, fed with the measured load (it draws further while frames have time to spare, between `ddmin` 0.45 and `ddmax` 1.0); a number fixes it, as DDGModernizer does (0.9 doubles what is drawn compared with 0.45); `original`: the controller with the original's timing, which keeps it at 0.45 on a PC |
 | `fullscreen`, `crop` | borderless fullscreen; show only the game's 4:3 canvas without the overscan margins |
 | `maxfps` | draw at most this many frames per second (30, 20, 15; 0 = 60). The game always runs at full speed |
 | `frameskip` | skip drawing up to n frames in a row when the machine falls behind, instead of slowing down |

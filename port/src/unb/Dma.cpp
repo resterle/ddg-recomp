@@ -116,6 +116,82 @@ void CDma::Vif1(const uint32_t *tagWords, int nTagWords, const uint8_t *data, si
     }
 }
 
+void CDma::Flatten(const void *pBase, uint32_t tadr, std::vector<Segment> &segs, std::vector<uint8_t> &copy,
+                   const std::function<bool(const uint8_t *, size_t)> &inPlace)
+{
+    const uint8_t *base = static_cast<const uint8_t *>(pBase);
+    segs.clear();
+    copy.clear();
+    uint32_t asr[2] = {};
+    int asp = 0;
+    for (int guard = 0; guard < (1 << 20); guard++) {     // the tag walk of Send
+        const uint8_t *tag = base + tadr;
+        uint64_t lo;
+        memcpy(&lo, tag, 8);
+        uint32_t qwc = (uint32_t)lo & 0xffff, id = (uint32_t)(lo >> 28) & 7, addr = (uint32_t)(lo >> 32) & 0x7fffffff;
+        const uint8_t *madr = tag + 16;
+        uint32_t next = tadr;
+        bool end = false, ref = false;
+        switch (id) {
+        case 0: madr = base + addr; end = true; ref = true; break;
+        case 1: next = tadr + 16 + qwc * 16; break;
+        case 2: next = addr; break;
+        case 3: case 4: madr = base + addr; next = tadr + 16; ref = true; break;
+        case 5:
+            next = addr;
+            if (asp < 2) asr[asp++] = tadr + 16 + qwc * 16;
+            else end = true;
+            break;
+        case 6:
+            if (asp > 0) next = asr[--asp];
+            else end = true;
+            break;
+        case 7: end = true; break;
+        }
+        if (qwc) {                                  // Send skips tags without data (and their VIF codes)
+            Segment sg = {};
+            sg.words = qwc * 4;
+            memcpy(sg.vif, tag + 8, 8);
+            if (ref && inPlace && inPlace(madr, (size_t)qwc * 16)) {
+                sg.data = madr;
+            } else {
+                sg.copyOff = copy.size();
+                copy.insert(copy.end(), madr, madr + (size_t)qwc * 16);
+            }
+            segs.push_back(sg);
+        }
+        if (end) break;
+        tadr = next;
+    }
+}
+
+void CDma::SendSegments(const std::vector<Segment> &segs, const std::vector<uint8_t> &copy, uint32_t chcr, bool bSnapshotKey)
+{
+    uint64_t t0 = SDL_GetTicksNS();
+    CGraphic::BeginFrame();
+    CGraphic::HoldRecordingLock(true);
+    int nTag = (chcr & dma::CHCR_TTE) ? 2 : 0;
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (i + 1 < segs.size()) {                  // the next segment's data (model packets: cache misses)
+            const Segment &n = segs[i + 1];
+            const uint8_t *nd = n.data ? n.data : copy.data() + n.copyOff;
+            for (uint32_t k = 0; k < SDL_min(n.words * 4, 512u); k += 64) __builtin_prefetch(nd + k);
+        }
+        const Segment &sg = segs[i];
+        stats.tags++;
+        Vif1(sg.vif, nTag, sg.data ? sg.data : copy.data() + sg.copyOff, sg.words);
+    }
+    CGraphic::HoldRecordingLock(false);             // EndFrame may wait
+    static const bool trace = getenv("RECOMP_TRACE_TICKS") != nullptr;
+    static uint64_t sum, n;
+    if (trace) {
+        sum += SDL_GetTicksNS() - t0;
+        if (++n == 300) { SDL_Log("dma: %.2f ms per frame chain (VIF1 send)", sum / 300e6); sum = n = 0; }
+    }
+    CGraphic::EndFrame(bSnapshotKey);
+    if (handlerEnabled[dma::VIF1] && handlers[dma::VIF1]) handlers[dma::VIF1](dma::VIF1);
+}
+
 void CDma::Send(int channel, const void *pBase, uint32_t tadr, uint32_t chcr, bool bSnapshotKey)
 {
     const uint8_t *base = static_cast<const uint8_t *>(pBase);

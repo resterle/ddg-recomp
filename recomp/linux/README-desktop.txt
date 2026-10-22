@@ -8,7 +8,8 @@ Start:   ./perfect_recomp "<folder with perfect.exe and cddata>"
 
 Settings and saves: ~/.local/share/TAITO/DengoFinal/ (graphics.ini, written by the settings
 window). Other graphics.ini keys:
-  drawdistance = 0.90  scenery distance (0.9 is the PC original)
+  drawdistance = auto  scenery distance: auto = the game's own (original); a number fixes it
+                       (as DDGModernizer does; 0.9 draws about twice as much as auto)
   frameskip = 0        skip drawing up to n frames in a row when the PC falls behind
   maxfps = 0           draw at most n frames per second (30, 20, 15; 0 = 60)
   texformat = 1        32-bit textures (0 = paletted, as the original)

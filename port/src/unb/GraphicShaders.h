@@ -271,12 +271,14 @@ vertex VSOut vs_present(uint vid [[vertex_id]])
 }
 
 // Must match PresentParams in Graphic.cpp. uvOffset/uvScale select the shown part of the scene.
-struct PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY; };
+struct PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY, uvMinX, uvMinY, uvMaxX, uvMaxY; };
 
 fragment float4 fs_present(VSOut in [[stage_in]], constant PresentParams &p [[buffer(0)]],
                            texture2d<float> scene [[texture(0)]], sampler smp [[sampler(0)]])
 {
-    float4 c = scene.sample(smp, float2(p.uvOffsetX, p.uvOffsetY) + in.uv * float2(p.uvScaleX, p.uvScaleY));
+    float2 uv = clamp(float2(p.uvOffsetX, p.uvOffsetY) + in.uv * float2(p.uvScaleX, p.uvScaleY),
+                      float2(p.uvMinX, p.uvMinY), float2(p.uvMaxX, p.uvMaxY));
+    float4 c = scene.sample(smp, uv);
     return float4(pow(c.rgb, float3(p.invGamma)), 1.0);
 }
 )MSL";

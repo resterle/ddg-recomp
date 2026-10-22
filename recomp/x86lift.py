@@ -57,6 +57,10 @@ class Lifter:
         # instruction address -> C expression replacing its immediate operand (runtime settings
         # in place of values that patchers wrote into the code, see plan.IMM_OVERRIDES)
         self.imm_overrides = {}
+        # instruction address -> C expression replacing an absolute memory address, and -> C
+        # expression that also takes a conditional jump (plan.MEM_OVERRIDES, BRANCH_OVERRIDES)
+        self.mem_overrides = {}
+        self.branch_overrides = {}
         # LIFT_NO_FPU_LOCALS / LIFT_NO_INTRINSICS switch these off (debugging, A/B tests)
         self.fpu_locals = not os.environ.get('LIFT_NO_FPU_LOCALS')     # x87 stack in locals where provable
         self.intrinsics = not os.environ.get('LIFT_NO_INTRINSICS')     # inline MSVC runtime helpers
@@ -225,6 +229,8 @@ class Lifter:
     def addr32(self, ins, op):
         """The effective address as a 32-bit value (lea)."""
         m = op.mem
+        if ins.address in self.mem_overrides and m.base == X86_REG_INVALID and m.index == X86_REG_INVALID:
+            return '(uint32_t)(%s)' % self.mem_overrides[ins.address]
         parts = []
         if m.base != X86_REG_INVALID:
             parts.append(self.reg_read(ins, m.base))
@@ -244,6 +250,8 @@ class Lifter:
         if not self.addr64:
             return self.addr32(ins, op)
         m = op.mem
+        if ins.address in self.mem_overrides and m.base == X86_REG_INVALID and m.index == X86_REG_INVALID:
+            return '(RtAddr)(%s)' % self.mem_overrides[ins.address]
         regs = []
         if m.base != X86_REG_INVALID:
             regs.append(self.reg_read(ins, m.base))
@@ -706,7 +714,10 @@ class Lifter:
             if m == 'jecxz':
                 out.append('if (!ecx) goto L_%08x;' % t)
             else:
-                out.append('if (%s) goto L_%08x;' % (COND[m[1:]], t))
+                cond = COND[m[1:]]
+                if a in self.branch_overrides:
+                    cond = '(%s) || (%s)' % (self.branch_overrides[a], cond)
+                out.append('if (%s) goto L_%08x;' % (cond, t))
         elif m == 'jmp':
             op = ops[0]
             if a in tables:

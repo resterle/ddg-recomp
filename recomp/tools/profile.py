@@ -7,6 +7,7 @@ usage: tools/profile.py <profile.txt> <perfect_recomp binary of that run> [top N
        PROFILE_FUNCS=1: list translated game functions (F_xxxxxxxx) by name instead of as one entry
        PROFILE_CALLERS=1: samples in shared libraries are listed with their caller (from the link
        register, arm64 profiles; exact for leaf functions such as memcpy)
+       PROFILE_LINES=1: samples in the executable are counted per source line (function file:line)
 
 Samples in the executable are symbolised with llvm-symbolizer (llvm-symbolizer, llvm-symbolizer-16,
 or the one in the ddg-recomp-cross Docker image); other samples are counted per library.
@@ -41,7 +42,12 @@ def symbolizer(binary, addrs):
         cmd = ['docker', 'run', '--rm', '-i', '-v', d + ':/b', 'ddg-recomp-cross', 'llvm-symbolizer-16',
                '--obj=/b/' + os.path.basename(binary), '--functions=linkage', '--no-inlines']
     out = subprocess.run(cmd, input=''.join('0x%x\n' % a for a in addrs), capture_output=True, text=True).stdout
-    names = [blk.split('\n')[0] for blk in out.strip().split('\n\n')]
+    lines = os.environ.get('PROFILE_LINES') == '1'
+    names = []
+    for blk in out.strip().split('\n\n'):
+        f = blk.split('\n')
+        loc = os.path.basename(f[1]).rsplit(':', 1)[0] if lines and len(f) > 1 else ''
+        names.append(f[0] + ('  ' + loc if loc else ''))
     return dict(zip(addrs, names))
 
 
@@ -68,9 +74,13 @@ def main():
         threads[main_tid] = 'game (main)'
     libdir = os.environ.get('PROFILE_LIBS')
     files = {}                                       # mapped file name -> local ELF to symbolise with
+    exe = os.path.basename(binary)
+
+    def is_exe(base):
+        return base.startswith('perfect_recomp') or base == exe
     for _, _, _, path in maps:
         base = os.path.basename(path)
-        if base.startswith('perfect_recomp'):
+        if is_exe(base):
             files[base] = binary
         elif libdir and os.path.exists(os.path.join(libdir, base)):
             files[base] = os.path.join(libdir, base)
@@ -99,7 +109,7 @@ def main():
     def label(base, v):
         sym = names.get(base, {}).get(v) if v is not None else None
         if sym and sym != '??':
-            name = sym if base.startswith('perfect_recomp') else '%s [%s]' % (sym, base)
+            name = sym if is_exe(base) else '%s [%s]' % (sym, base)
         else:
             name = '[' + base + ']'
         if not funcs and (name.startswith('F_') or name.startswith('A_')):
@@ -109,10 +119,10 @@ def main():
     per_thread = collections.defaultdict(collections.Counter)
     for tid, (base, v), (lbase, lv) in located:
         name = label(base, v)
-        if callers and not base.startswith('perfect_recomp') and lbase.startswith('perfect_recomp'):
+        if callers and not is_exe(base) and is_exe(lbase):
             name += '  <- ' + label(lbase, lv)
         tname = threads.get(tid, 'thread %d' % tid)
-        if tname == 'perfect_recomp':
+        if tname == 'perfect_recomp' or tname == exe:
             tname = 'other threads'
         per_thread[tname][name] += 1
     total = len(samples)

@@ -235,11 +235,12 @@ layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 fragColor;
 layout(set = 2, binding = 0) uniform sampler2D scene;
 // Must match PresentParams in Graphic.cpp. uvOffset/uvScale select the shown part of the scene.
-layout(set = 3, binding = 0) uniform PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY; };
+layout(set = 3, binding = 0) uniform PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY, uvMinX, uvMinY, uvMaxX, uvMaxY; };
 
 void main()
 {
-    vec4 c = texture(scene, vec2(uvOffsetX, uvOffsetY) + vUV * vec2(uvScaleX, uvScaleY));
+    vec2 uv = clamp(vec2(uvOffsetX, uvOffsetY) + vUV * vec2(uvScaleX, uvScaleY), vec2(uvMinX, uvMinY), vec2(uvMaxX, uvMaxY));
+    vec4 c = texture(scene, uv);
     fragColor = vec4(pow(c.rgb, vec3(invGamma)), 1.0);
 }
 #endif

@@ -57,7 +57,7 @@ struct FSParams {           // must match FSParams in GraphicShaders.h
     uint32_t addrU, addrV, linear, texW, texH, palX, palY;
 };
 
-struct PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY; };   // must match GraphicShaders.h
+struct PresentParams { float invGamma, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY, uvMinX, uvMinY, uvMaxX, uvMaxY; };   // must match GraphicShaders.h, scene.glsl
 
 // Render state in Direct3D 8 terms, with D3D defaults.
 struct State {
@@ -131,6 +131,10 @@ struct CGraphic::Impl {
     std::unordered_map<uint64_t, SDL_GPUGraphicsPipeline *> pipes;
     std::unordered_map<uint32_t, SDL_GPUSampler *> samplers;
     SDL_GPUSampler *pPresentSampler = nullptr;
+    SDL_GPUSampler *pOverlaySampler = nullptr;      // nearest (CGraphic::SetOverlay)
+    SDL_GPUTexture *pOverlayTex = nullptr;
+    int overlayTexW = 0, overlayTexH = 0;
+    uint32_t overlayVersion = 0;
 
     SDL_GPUTextureFormat depthFormat = SDL_GPU_TEXTUREFORMAT_INVALID;
     SDL_GPUTexture *pDepth = nullptr;
@@ -891,6 +895,8 @@ bool CGraphic::Init(SDL_Window *window)
     si.min_filter = si.mag_filter = SDL_GPU_FILTER_LINEAR;
     si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     g->pPresentSampler = SDL_CreateGPUSampler(m_pDevice, &si);
+    si.min_filter = si.mag_filter = SDL_GPU_FILTER_NEAREST;
+    g->pOverlaySampler = SDL_CreateGPUSampler(m_pDevice, &si);
 
     // Scene targets (texture slots 0 and 1), depth buffer, helpers.
     uint32_t w = (uint32_t)m_Config.scrwidth, h = (uint32_t)m_Config.scrheight;
@@ -943,6 +949,8 @@ void CGraphic::Term()
         for (auto &s : g->samplers) SDL_ReleaseGPUSampler(m_pDevice, s.second);
         if (g->pPresentPipe) SDL_ReleaseGPUGraphicsPipeline(m_pDevice, g->pPresentPipe);
         if (g->pPresentSampler) SDL_ReleaseGPUSampler(m_pDevice, g->pPresentSampler);
+        if (g->pOverlaySampler) SDL_ReleaseGPUSampler(m_pDevice, g->pOverlaySampler);
+        if (g->pOverlayTex) SDL_ReleaseGPUTexture(m_pDevice, g->pOverlayTex);
         for (SDL_GPUShader *s : {g->pVS[0], g->pVS[1], g->pFS[0], g->pFS[1], g->pMeshVS[0], g->pMeshVS[1],
                                  g->pMeshFS[0], g->pMeshFS[1], g->pPresentVS, g->pPresentFS})
             if (s) SDL_ReleaseGPUShader(m_pDevice, s);
@@ -968,6 +976,8 @@ CGraphic::DebugStats &CGraphic::GetDebugStats() { g_stats.pipelines = g ? (uint3
 
 uint32_t CGraphic::GetFrameSerial() { return g_frameSerial; }
 void CGraphic::HoldRecordingLock(bool) {}
+bool CGraphic::Threaded() { return false; }
+uint64_t CGraphic::FrameLoadNs() { return 0; }
 
 bool CGraphic::BeginFrame()
 {
@@ -1024,6 +1034,66 @@ bool CGraphic::PresentPending()
     return PresentTexture(g->pPresentTex, g->tex[0]->nWidth, g->tex[0]->nHeight);
 }
 
+// CGraphic::SetOverlay: the image (rows top-down) and its version, drawn by PresentTexture
+static struct {
+    std::mutex lock;
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    uint32_t version = 0;
+} g_overlay;
+
+void CGraphic::SetOverlay(const uint8_t *pRGBA, int nWidth, int nHeight)
+{
+    std::lock_guard<std::mutex> lk(g_overlay.lock);
+    if (!pRGBA || nWidth <= 0 || nHeight <= 0) { g_overlay.w = g_overlay.h = 0; return; }
+    g_overlay.px.assign(pRGBA, pRGBA + (size_t)nWidth * nHeight * 4);
+    g_overlay.w = nWidth;
+    g_overlay.h = nHeight;
+    g_overlay.version++;
+}
+
+bool CGraphic::HasFpsCounter() { return false; }
+bool CGraphic::FpsCounter() { return false; }
+void CGraphic::SetFpsCounter(bool) {}
+
+// Uploads a changed overlay image in cmd (before the render pass); the overlay's size, 0 = none.
+static void UploadOverlay(SDL_GPUCommandBuffer *cmd, int &w, int &h)
+{
+    std::lock_guard<std::mutex> lk(g_overlay.lock);
+    w = g_overlay.w;
+    h = g_overlay.h;
+    if (!w) return;
+    SDL_GPUDevice *dev = CGraphic::GetDevice();
+    if (g->pOverlayTex && g->overlayVersion == g_overlay.version) return;
+    if (!g->pOverlayTex || g->overlayTexW != w || g->overlayTexH != h) {
+        if (g->pOverlayTex) SDL_ReleaseGPUTexture(dev, g->pOverlayTex);
+        g->pOverlayTex = MakeGPUTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, (uint32_t)w, (uint32_t)h, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        g->overlayTexW = w;
+        g->overlayTexH = h;
+        if (!g->pOverlayTex) { w = 0; return; }
+    }
+    uint32_t size = (uint32_t)w * (uint32_t)h * 4;
+    SDL_GPUTransferBufferCreateInfo ti = {};
+    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    ti.size = size;
+    SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &ti);
+    if (!tb) { w = 0; return; }
+    memcpy(SDL_MapGPUTransferBuffer(dev, tb, false), g_overlay.px.data(), size);
+    SDL_UnmapGPUTransferBuffer(dev, tb);
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo src = {};
+    src.transfer_buffer = tb;
+    SDL_GPUTextureRegion dst = {};
+    dst.texture = g->pOverlayTex;
+    dst.w = (Uint32)w;
+    dst.h = (Uint32)h;
+    dst.d = 1;
+    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+    SDL_EndGPUCopyPass(copy);
+    SDL_ReleaseGPUTransferBuffer(dev, tb);
+    g->overlayVersion = g_overlay.version;
+}
+
 static bool PresentTexture(SDL_GPUTexture *pScene, uint32_t w, uint32_t h)
 {
     SDL_GPUDevice *m_pDevice = CGraphic::GetDevice();
@@ -1036,6 +1106,8 @@ static bool PresentTexture(SDL_GPUTexture *pScene, uint32_t w, uint32_t h)
         return FAIL("SDL_WaitAndAcquireGPUSwapchainTexture");
     }
     if (swap) {
+        int ow = 0, oh = 0;
+        UploadOverlay(cmd, ow, oh);
         // Scale the scene into the window, keeping its aspect ratio. With `crop` only the game's
         // canvas is shown: the PS2 game draws its picture at (20,30)-(620,450) of the 640x480
         // layout (the same share of its 640x448 frame on both axes, so it displays at 4:3) and
@@ -1058,9 +1130,23 @@ static bool PresentTexture(SDL_GPUTexture *pScene, uint32_t w, uint32_t h)
         SDL_BindGPUGraphicsPipeline(pass, g->pPresentPipe);
         SDL_GPUTextureSamplerBinding tb = {pScene, g->pPresentSampler};
         SDL_BindGPUFragmentSamplers(pass, 0, &tb, 1);
-        PresentParams pp = {1.0f / (g->gamma > 0 ? g->gamma : 1.0f), u0, v0, us, vs};
+        // sampling stays half a texel inside the shown part: bilinear filtering at the screen edge
+        // would otherwise mix in the overscan margin (stripes at the edges with crop)
+        float hu = 0.5f / (float)w, hv = 0.5f / (float)h;
+        PresentParams pp = {1.0f / (g->gamma > 0 ? g->gamma : 1.0f), u0, v0, us, vs, u0 + hu, v0 + hv, u0 + us - hu, v0 + vs - hv};
         SDL_PushGPUFragmentUniformData(cmd, 0, &pp, sizeof(pp));
         SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+        if (ow) {                                   // the overlay: centred, integer scale, opaque
+            int scale = SDL_max(1, SDL_min((int)sw * 15 / 16 / ow, (int)sh * 15 / 16 / oh));
+            SDL_GPUViewport ovp = {(float)(((int)sw - ow * scale) / 2), (float)(((int)sh - oh * scale) / 2),
+                                   (float)(ow * scale), (float)(oh * scale), 0, 1};
+            SDL_SetGPUViewport(pass, &ovp);
+            SDL_GPUTextureSamplerBinding ob = {g->pOverlayTex, g->pOverlaySampler};
+            SDL_BindGPUFragmentSamplers(pass, 0, &ob, 1);
+            PresentParams op = {1.0f, 0, 0, 1, 1, 0, 0, 1, 1};
+            SDL_PushGPUFragmentUniformData(cmd, 0, &op, sizeof(op));
+            SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+        }
         SDL_EndGPURenderPass(pass);
     }
     if (!SDL_SubmitGPUCommandBuffer(cmd)) return FAIL("SDL_SubmitGPUCommandBuffer");

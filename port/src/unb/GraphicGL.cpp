@@ -41,6 +41,8 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <tuple>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -79,7 +81,7 @@ enum : GLenum {
     GL_EQUAL = 0x0202, GL_LEQUAL = 0x0203, GL_GREATER = 0x0204, GL_NOTEQUAL = 0x0205, GL_GEQUAL = 0x0206,
     GL_ALWAYS = 0x0207, GL_FRONT = 0x0404, GL_BACK = 0x0405, GL_CW = 0x0900, GL_CCW = 0x0901,
     GL_CULL_FACE = 0x0B44, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_SCISSOR_TEST = 0x0C11,
-    GL_UNPACK_ALIGNMENT = 0x0CF5, GL_PACK_ALIGNMENT = 0x0D05, GL_TEXTURE_2D = 0x0DE1, GL_UNSIGNED_BYTE = 0x1401,
+    GL_UNPACK_ALIGNMENT = 0x0CF5, GL_PACK_ALIGNMENT = 0x0D05, GL_TEXTURE_2D = 0x0DE1, GL_UNSIGNED_BYTE = 0x1401, GL_SHORT = 0x1402,
     GL_FLOAT = 0x1406, GL_RED = 0x1903, GL_RGBA = 0x1908, GL_NEAREST = 0x2600, GL_LINEAR = 0x2601,
     GL_TEXTURE_MAG_FILTER = 0x2800, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_WRAP_S = 0x2802,
     GL_TEXTURE_WRAP_T = 0x2803, GL_REPEAT = 0x2901, GL_CLAMP_TO_EDGE = 0x812F, GL_MIRRORED_REPEAT = 0x8370,
@@ -328,7 +330,8 @@ static uint64_t g_nsTex, g_nsList, g_nsUpload, g_nsSubmit, g_nsPresent, g_nsSwap
 // RECOMP_TRACE_TICKS: submission statistics (per 600 frames): items (draw calls) and binds by kind
 static uint64_t g_cProg, g_cBlock, g_cState, g_cScissor, g_cTex, g_cSampler, g_cVao, g_cWindow, g_cItems2D, g_cItemsMesh;
 // RECOMP_GL_EXP (GPU cost analysis): 1 trivial fragment shading (vertex colour), 2 scissor every
-// draw to 1 pixel (vertex and tiling work only), 4 no present blit
+// draw to 1 pixel (vertex and tiling work only), 4 no present blit; leave out 8 2D draws, 16 blended,
+// 32 alpha-tested, 64 opaque mesh draws, 128 full-screen 2D quads, 256 the other 2D draws
 static int g_exp;
 // RECOMP_TRACE_SPIKES: time in texture/mesh create/destroy/upload calls (outermost call only)
 uint64_t g_gfxWaitNs;                     // game thread waiting for the render thread
@@ -356,7 +359,10 @@ struct TexArray {
     std::vector<uint16_t> freeLayers;
 };
 
+static uint64_t g_texUid;                   // CGraphicTexture::uid
 struct CGraphicTexture {
+    uint64_t             uid = ++g_texUid;  // unique per texture object (addresses get reused)
+    uint32_t             contentGen = 0;    // bumped when the texels change (UnlockTexture)
     GLuint               id = 0;            // GL texture, created on upload (not arrayed)
     GLuint               fbo = 0;           // render targets
     uint32_t             nWidth = 0, nHeight = 0;
@@ -391,6 +397,23 @@ struct CGraphicTexture {
     GLuint               standIn = 0;               // render thread: 1x1 texture drawn until the upload (ApplyUploads)
 };
 
+// Batched vertices (Job::List::sverts, CGraphicMesh::unique): normals and UVs as the game's int16
+// fixed point (value * 4096, see CVertex::BuildPacket), which the batch shader scales back; exact,
+// and 24 bytes instead of MeshVertex's 32 to copy and upload per frame.
+struct PreVertex { float x, y, z; int16_t nx, ny, nz, pad; int16_t u, v; };
+static_assert(sizeof(PreVertex) == 24, "packed");
+
+static inline int16_t Fixed12(float f)
+{
+    long i = lroundf(f * 4096.0f);
+    return (int16_t)(i < -32768 ? -32768 : i > 32767 ? 32767 : i);
+}
+
+static inline PreVertex Pack(const MeshVertex &m)
+{
+    return PreVertex{m.x, m.y, m.z, Fixed12(m.nx), Fixed12(m.ny), Fixed12(m.nz), 0, Fixed12(m.u), Fixed12(m.v)};
+}
+
 struct CGraphicMesh {
     uint32_t                offset = 0;
     uint32_t                index = 0;      // in Impl::meshes
@@ -399,7 +422,7 @@ struct CGraphicMesh {
     // render thread (batching): staging without repeated vertices, and staging as indices into it
     // (models are unrolled triangle lists; drawn indexed, each vertex is shaded once)
     bool                    indexed = false;
-    std::vector<MeshVertex> unique;
+    std::vector<PreVertex> unique;
     std::vector<uint16_t>   indices;
 };
 
@@ -422,6 +445,10 @@ struct UploadReq {
 // thread does not wait for the driver or the GPU. Texture and palette data are copied for the
 // queue (the game may rewrite them meanwhile); meshes are immutable and freed only after the jobs
 // that may use them.
+// A draw list entry: a 2D draw, an unbatched mesh draw or a batch of mesh draws
+struct ListItem { uint32_t draw, block, first, count, window; uint8_t kind; uint32_t vfirst = 0, vlast = 0; };    // kind: 0 2D, 1 mesh, 2 batch
+constexpr uint32_t kAnyBlock = ~1u;                 // the item's shaders read no parameter block
+
 struct Job {
     std::vector<Vertex> verts;
     std::vector<DrawCmd> draws;
@@ -442,13 +469,30 @@ struct Job {
     bool present = false, snapshot = false;
     CGraphicTexture *scene = nullptr;
     float gamma = 1.0f;
+    // the draw list (BuildList); kept with the job so that its buffers keep their capacity
+    struct List {
+        std::vector<ListItem> items;
+        std::vector<uint8_t> blockData;             // parameter blocks
+        std::vector<PreVertex> sverts;              // batched vertices
+        std::vector<uint8_t> sslots;                // their draw slot within the batch window
+        std::vector<uint32_t> sindices;             // batched triangles (indices into sverts)
+        std::vector<float> drawData;                // kSlotBytes per batched draw; only grows
+        size_t drawUsed = 0;                        // floats of drawData in use
+        uint64_t ns = 0, ins = 0, meshDraws = 0, meshVerts = 0;    // RECOMP_TRACE_TICKS
+        bool built = false;
+    } list;
+    int listState = 0;                              // with the list thread: 0 queued, 1 being built, 2 built (queueLock)
 };
 
 // What presenting needs; per context (vertex arrays are not shared between contexts), so the
 // present thread has its own.
 struct PresentRes {
     GLuint prog = 0, vao = 0, fpsTex = 0, samplerLinear = 0, samplerNearest = 0;
-    GLint uPresent = -1, uScaleY = -1;
+    GLuint overlayTex = 0;                          // CGraphic::SetOverlay's image, at overlayVersion
+    uint32_t overlayVersion = 0;
+    GLint uPresent = -1, uScaleY = -1, uLutOn = -1, uClamp = -1;
+    GLuint lut = 0;                                 // gamma table (256x1 R8), for lutGamma
+    float lutGamma = 0;
 };
 
 // Recursive lock for the recording state. Taken thousands of times per frame (every model and
@@ -488,7 +532,6 @@ struct CGraphic::Impl {
     PresentRes inlinePresent;                       // presenting on the render thread (no asyncPresent)
     GLuint ubo = 0;
     uint32_t uboStride = 0;                         // sizeof(ParamBlock) rounded to the offset alignment
-    std::vector<uint8_t> blockData;                 // the current flush's parameter blocks
     std::unordered_map<uint32_t, GLuint> samplers;
     GLuint depthRB = 0, vao2D = 0, vaoMesh = 0, vb2D = 0, arenaVB = 0;
     // batching: runs of order-independent mesh draws are sorted by state and merged; their vertices
@@ -496,13 +539,8 @@ struct CGraphic::Impl {
     bool batching = true;
     GLuint vaoPre = 0, preVB = 0, slotVB = 0, uboDraws = 0;
     uint32_t batchSlots = 64, uboAlign = 16;
-    std::vector<MeshVertex> sverts;                 // this flush's batched vertices
-    std::vector<uint8_t> sslots;                    // their draw slot within the batch window
-    std::vector<uint32_t> sindices;                 // this flush's batched triangles (indices into sverts)
     GLuint indexVB = 0;
     uint64_t dedupVerts = 0, dedupUnique = 0;       // RECOMP_TRACE_TICKS: meshes indexed so far
-    std::vector<float> drawData;                    // kSlotBytes per batched draw; only grows
-    size_t drawUsed = 0;                            // floats of drawData in use this flush
     std::vector<CGraphicMesh *> deadMeshes;         // destroyed, freed after the next flush
     std::vector<std::pair<uint32_t, uint32_t>> stripRuns;  // batched strips: first vertex, count
     // the last batched strip draw's inputs, so that the model's following strips (same constants
@@ -561,6 +599,8 @@ struct CGraphic::Impl {
     // "threaded": the render thread and its job queue (see Job)
     bool threaded = false;
     std::thread thread;
+    bool listThreaded = false;                      // the list thread builds draw lists ahead (ListMain)
+    std::thread listThread;
     std::mutex queueLock;                           // queue, freeJobs, setup and quit flags
     std::condition_variable queueCv;
     std::deque<Job *> queue;
@@ -606,6 +646,11 @@ struct CGraphic::Impl {
     GLsync frameFence = nullptr;                    // render thread: end of the previous frame (GPU backpressure)
     std::atomic<uint64_t> presentsShown{0}, presentsDropped{0}, presentSwapNs{0}, frameWaitNs{0}, presentWaitNs{0}, presentBlitNs{0};
     std::atomic<uint64_t> paceWaitNs{0};
+    // render thread: per frame, the list thread's time and the wait for the GPU to finish the
+    // previous frame (HandOff); frameLoadNs = the slowest of render thread + GPU wait (about
+    // max(render thread, GPU)) and list thread for the last frame (FrameLoadNs)
+    uint64_t listFrameNs = 0, gpuWaitFrameNs = 0;
+    std::atomic<uint64_t> frameLoadNs{0};
     std::atomic<uint64_t> presentGapMaxNs{0}, presentHitches{0};   // longest time between two shown frames, gaps over 50 ms
 
     // shader variants compiled by either thread (render thread, warm-up thread), the warm-up
@@ -831,6 +876,7 @@ layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec2 aUV;
 layout(location = 3) in float aSlot;
 layout(std140) uniform Draws { vec4 dV[DRAW_SLOTS * 13]; };
+const float kFixed = 1.0 / 4096.0;  // normals and UVs arrive as int16 fixed point (PreVertex)
 FLAT out vec4 vColor;
 out vec2 vUV;
 out float vFog;
@@ -845,13 +891,15 @@ void main()
     int kind = int(dV[b].w);
     vec4 p = aPos.x * dV[b + 4] + aPos.y * dV[b + 5] + aPos.z * dV[b + 6] + dV[b + 7];
     if (kind == 2 || kind == 3) p.z += dV[b + 12].z;
-    vec4 d = vec4(max(vec3(dot(aNormal, dV[b + 8].xyz), dot(aNormal, dV[b + 9].xyz), dot(aNormal, dV[b + 10].xyz)), 0.0), 1.0);
+    vec3 n = aNormal * kFixed;
+    vec2 uv = aUV * kFixed;
+    vec4 d = vec4(max(vec3(dot(n, dV[b + 8].xyz), dot(n, dV[b + 9].xyz), dot(n, dV[b + 10].xyz)), 0.0), 1.0);
     vec3 lit = vec3(dot(d, dV[b + 1]), dot(d, dV[b + 2]), dot(d, dV[b + 3]));
     bool lighting = kind == 0 || kind == 2;
     vColor = clamp(lighting ? vec4(lit, 1.0) * dV[b + 11] : dV[b + 11], 0.0, 1.0);
-    if (kind == 2) vUV = aUV + dV[b + 12].xy;
+    if (kind == 2) vUV = uv + dV[b + 12].xy;
     else if (kind == 3) vUV = min(vec2(dV[b + 12].x, dot(d, dV[b + 2])), 1.0);
-    else vUV = aUV;
+    else vUV = uv;
     vFog = kind == 2 ? 1.0 : clamp((dV[b].y - p.w) * dV[b].z, 0.0, 1.0);
     if (p.w > 0.0) p.z = clamp(p.z, 0.0, p.w);
     gl_Position = vec4(p.x, p.y, 2.0 * p.z - p.w, p.w);
@@ -885,14 +933,24 @@ void main()
 static const char kFSPresent[] = R"GLSL(
 in vec2 vUV;
 uniform sampler2D uScene;
-uniform vec4 uPresent;      // invGamma, uvOffsetX, uvOffsetY (from the top), uvScaleX
+uniform sampler2D uLut;     // gamma table: 256 texels, texel i = (i/255)^invGamma
+uniform vec4 uPresent;      // invGamma (unused), uvOffsetX, uvOffsetY (from the top), uvScaleX
 uniform float uScaleY;
+uniform float uLutOn;       // 0: no gamma (identity)
+uniform vec4 uClamp;        // sampling bounds (from the top): half a texel inside the shown part
 out vec4 fragColor;
 void main()
 {
-    vec2 uv = vec2(uPresent.y + vUV.x * uPresent.w, 1.0 - (uPresent.z + vUV.y * uScaleY));
+    vec2 t = clamp(vec2(uPresent.y + vUV.x * uPresent.w, uPresent.z + vUV.y * uScaleY), uClamp.xy, uClamp.zw);
+    vec2 uv = vec2(t.x, 1.0 - t.y);
     vec4 c = texture(uScene, uv);
-    fragColor = vec4(pow(c.rgb, vec3(uPresent.x)), 1.0);
+    // a table lookup per channel instead of pow(): on the R36H's Mali-G31 the final pass took ~8%
+    // of the GPU's time at 60 frames/s, the per-pixel pow ~3 points of it
+    if (uLutOn != 0.0) {
+        vec3 t = c.rgb * (255.0 / 256.0) + 0.5 / 256.0;
+        c.rgb = vec3(texture(uLut, vec2(t.r, 0.5)).r, texture(uLut, vec2(t.g, 0.5)).r, texture(uLut, vec2(t.b, 0.5)).r);
+    }
+    fragColor = vec4(c.rgb, 1.0);
 }
 )GLSL";
 
@@ -1395,8 +1453,15 @@ static bool CreatePresentRes(PresentRes &r)
     if (!r.prog) return false;
     gl.UseProgram(r.prog);
     gl.Uniform1i(gl.GetUniformLocation(r.prog, "uScene"), 0);
+    gl.Uniform1i(gl.GetUniformLocation(r.prog, "uLut"), 2);   // unit 2: unused by the scene (1 is the palette)
     r.uPresent = gl.GetUniformLocation(r.prog, "uPresent");
     r.uScaleY = gl.GetUniformLocation(r.prog, "uScaleY");
+    r.uLutOn = gl.GetUniformLocation(r.prog, "uLutOn");
+    r.uClamp = gl.GetUniformLocation(r.prog, "uClamp");
+    gl.GenTextures(1, &r.lut);
+    gl.BindTexture(GL_TEXTURE_2D, r.lut);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, 256, 1, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
     gl.GenVertexArrays(1, &r.vao);
     for (int i = 0; i < 2; i++) {
         GLuint &smp = i ? r.samplerLinear : r.samplerNearest;
@@ -1544,11 +1609,11 @@ static bool SetupGL()
     gl.BindVertexArray(g->vaoPre);
     gl.BindBuffer(GL_ARRAY_BUFFER, g->preVB);
     gl.EnableVertexAttribArray(0);
-    gl.VertexAttribPointer(0, 3, GL_FLOAT, 0, sizeof(MeshVertex), (void *)offsetof(MeshVertex, x));
+    gl.VertexAttribPointer(0, 3, GL_FLOAT, 0, sizeof(PreVertex), (void *)offsetof(PreVertex, x));
     gl.EnableVertexAttribArray(1);
-    gl.VertexAttribPointer(1, 3, GL_FLOAT, 0, sizeof(MeshVertex), (void *)offsetof(MeshVertex, nx));
+    gl.VertexAttribPointer(1, 3, GL_SHORT, 0, sizeof(PreVertex), (void *)offsetof(PreVertex, nx));
     gl.EnableVertexAttribArray(2);
-    gl.VertexAttribPointer(2, 2, GL_FLOAT, 0, sizeof(MeshVertex), (void *)offsetof(MeshVertex, u));
+    gl.VertexAttribPointer(2, 2, GL_SHORT, 0, sizeof(PreVertex), (void *)offsetof(PreVertex, u));
     gl.BindBuffer(GL_ARRAY_BUFFER, g->slotVB);
     gl.EnableVertexAttribArray(3);
     gl.VertexAttribPointer(3, 1, GL_UNSIGNED_BYTE, 0, 1, nullptr);
@@ -1578,11 +1643,11 @@ static void FillBlockFS(ParamBlock &b, const FSParams &f)
     b.f3[0] = (int32_t)lroundf(f.alphaRef * 255.0f);
 }
 
-static ParamBlock *NewBlock(uint32_t &index)
+static ParamBlock *NewBlock(std::vector<uint8_t> &blockData, uint32_t &index)
 {
-    index = (uint32_t)(g->blockData.size() / g->uboStride);
-    g->blockData.resize(g->blockData.size() + g->uboStride);
-    auto *b = reinterpret_cast<ParamBlock *>(&g->blockData[(size_t)index * g->uboStride]);
+    index = (uint32_t)(blockData.size() / g->uboStride);
+    blockData.resize(blockData.size() + g->uboStride);
+    auto *b = reinterpret_cast<ParamBlock *>(&blockData[(size_t)index * g->uboStride]);
     memset(b, 0, sizeof(ParamBlock));
     return b;
 }
@@ -1610,6 +1675,8 @@ static void ReleaseJob(Job *j)
     j->newArenaCap = 0;
     j->present = j->snapshot = false;
     j->clearColor = j->clearDepth = false;
+    j->list.built = false;
+    j->listState = 0;
     std::lock_guard<std::mutex> lk(g->queueLock);   // freeJobs is shared with the render thread
     g->freeJobs.push_back(j);
 }
@@ -1633,6 +1700,12 @@ static Job *Capture(bool always)
     j->draws.swap(g->draws);
     j->meshParams.swap(g->meshParams);
     j->stripRuns.swap(g->stripRuns);
+    // the vectors come back from the job pool with any capacity: room for a frame like this one
+    // (growing them while recording cost reallocations and copies every frame)
+    g->verts.reserve(j->verts.size());
+    g->draws.reserve(j->draws.size());
+    g->meshParams.reserve(j->meshParams.size());
+    g->stripRuns.reserve(j->stripRuns.size());
     g->lastStrip.mesh = nullptr;
     j->target = g->tex[g->target];
     j->clearColor = g->pendingClearColor;
@@ -2166,15 +2239,244 @@ static void BuildIndexed(CGraphicMesh *m)
                 if (m->unique.size() >= 65535) { m->unique.clear(); m->indices.clear(); return; }
                 table[k] = (int32_t)m->unique.size();
                 m->indices[i] = (uint16_t)m->unique.size();
-                m->unique.push_back(v);
+                m->unique.push_back(Pack(v));
                 break;
             }
-            if (!memcmp(&m->unique[(size_t)u], &v, sizeof(v))) { m->indices[i] = (uint16_t)u; break; }
+            PreVertex pv = Pack(v);
+            if (!memcmp(&m->unique[(size_t)u], &pv, sizeof(pv))) { m->indices[i] = (uint16_t)u; break; }
         }
     }
     m->unique.shrink_to_fit();
     g->dedupVerts += n;
     g->dedupUnique += m->unique.size();
+}
+
+// The draw list of a job (Job::List): parameter blocks, batched vertices, indices and draw slots,
+// and the items Execute draws. Uses nothing the render thread changes (texture arrays aside, whose
+// layers are assigned by uploads), so the list thread can build it ahead (see ListMain).
+static void BuildList(Job &j)
+{
+    Job::List &L = j.list;
+    CGraphicTexture &rt = *j.target;
+    // The draw list. Mesh draws get a parameter block per parameter set. Batched mesh draws are
+    // copied into a vertex stream in drawing order; runs of order-independent draws
+    // ("sortable": depth test and writes on, opaque or alpha-tested over-blending) are stably
+    // sorted by everything that affects their pixels, and equal neighbours share one draw call
+    // (up to kBatchSlots draws, whose vertex-shader constants are in the Draws uniform buffer).
+    uint64_t ins0 = rt_thread_instructions(), tl0 = SDL_GetTicksNS();
+    using Item = ListItem;
+    std::vector<Item> &items = L.items;
+    items.clear();
+    items.reserve(j.draws.size());
+    L.blockData.clear();
+    L.sverts.clear();
+    L.sslots.clear();
+    L.sindices.clear();
+    L.drawUsed = 0;
+    L.meshDraws = L.meshVerts = 0;
+    auto drawRoom = [&](size_t floats) {        // capacity without zero-filling each append
+        if (L.drawUsed + floats > L.drawData.size())
+            L.drawData.resize(SDL_max(L.drawUsed + floats, L.drawData.size() * 2 + 4096));
+    };
+    std::vector<uint32_t> meshBlock(j.meshParams.size(), ~0u);
+    auto meshBlockFor = [&](const DrawCmd &d) {
+        // unbatched draws of arrayed textures carry the layer in the block (lightLocal[0].w):
+        // a block per draw then, as parameter sets do not include the texture
+        uint32_t own = ~0u;
+        bool layered = !d.pre && d.pTex && d.pTex->arr;
+        uint32_t &mb = layered ? own : meshBlock[d.meshParams];
+        if (mb == ~0u) {
+            const auto &mp = j.meshParams[d.meshParams];
+            ParamBlock *b = NewBlock(L.blockData, mb);
+            memcpy(b->vs, mp.first.v, sizeof(b->vs));
+            FillBlockFS(*b, mp.second.p);
+            b->f3[1] = mp.first.kind;
+            b->fog[0] = mp.second.fogR; b->fog[1] = mp.second.fogG; b->fog[2] = mp.second.fogB;
+            if (layered) b->vs[8][3] = d.pTex->layer;
+        }
+        return mb;
+    };
+    auto sortable = [&](const DrawCmd &c) {
+        uint64_t k = c.pipeKey;
+        if (!c.pre || !(k & (1ull << 15)) || !(k & (1ull << 16)) || (k >> 25 & 15)) return false;
+        uint32_t zf = (k >> 17) & 15;
+        if (zf != CMP_LESS && zf != CMP_LESSEQUAL) return false;
+        if (!(k & (1ull << 3))) return true;
+        const FSParams &f = j.meshParams[c.meshParams].second.p;
+        return (k >> 4 & 15) == BLEND_SRCALPHA && (k >> 8 & 15) == BLEND_INVSRCALPHA && f.alphaTest &&
+               f.alphaFunc == CMP_GREATEREQUAL && f.alphaRef >= 0.5f;
+    };
+    auto cmpKey = [&](uint32_t a, uint32_t b) -> int {
+        const DrawCmd &x = j.draws[a], &y = j.draws[b];
+        if (x.pipeKey != y.pipeKey) return x.pipeKey < y.pipeKey ? -1 : 1;
+        if (TexKey(x.pTex) != TexKey(y.pTex)) return TexKey(x.pTex) < TexKey(y.pTex) ? -1 : 1;
+        if (x.samplerKey != y.samplerKey) return x.samplerKey < y.samplerKey ? -1 : 1;
+        if (int c = memcmp(&x.scissor, &y.scissor, sizeof(SDL_Rect))) return c;
+        return memcmp(&j.meshParams[x.meshParams].second, &j.meshParams[y.meshParams].second, sizeof(MeshFSParams));
+    };
+    // appends draw r to the stream (and its constants to a new slot); continues the last item
+    // when `merge` and the slot still fits its window
+    // Item::window is the window's byte offset in drawData (aligned for glBindBufferRange)
+    // Draw slots are allocated in windows of batchSlots; consecutive items share a window (one
+    // BindBufferRange per window, not per item). Everything a batched draw's shaders read
+    // is in its slot (only the paletted path still reads its parameter block), so the items
+    // of a window rebind nothing but program, state and texture.
+    size_t curWindow = ~(size_t)0;
+    uint64_t indexNs = 0;                       // time spent in BuildIndexed by this job
+    auto emitBatched = [&](uint32_t di, bool merge) {
+        const DrawCmd &r = j.draws[di];
+        size_t at = L.drawUsed;
+        if (curWindow == ~(size_t)0 || (at * 4 - curWindow) / kSlotBytes >= g->batchSlots) {
+            size_t aligned = (at * 4 + g->uboAlign - 1) / g->uboAlign * g->uboAlign;
+            drawRoom(aligned / 4 - at);
+            L.drawUsed = at = aligned / 4;
+            curWindow = aligned;
+            merge = false;                      // an item draws from one window
+        }
+        if (!merge || items.empty() || items.back().kind != 2) {
+            uint32_t block = j.meshParams[r.meshParams].second.p.mode == 2 ? meshBlockFor(r) : kAnyBlock;
+            items.push_back({di, block, (uint32_t)L.sindices.size(), 0, (uint32_t)curWindow, 2, (uint32_t)L.sverts.size(), 0});
+        }
+        Item &it = items.back();
+        uint32_t slot = (uint32_t)((at * 4 - it.window) / kSlotBytes);
+        const auto &mp = j.meshParams[r.meshParams];
+        drawRoom(kSlotBytes / 4);
+        L.drawUsed = at + kSlotBytes / 4;
+        memcpy(&L.drawData[at], mp.first.v, sizeof(mp.first.v));
+        L.drawData[at + 3] = (float)mp.first.kind;        // fog.w
+        L.drawData[at + 8 * 4 + 3] = r.pTex && r.pTex->arr ? (float)r.pTex->layer : 0.0f;   // lightLocal[0].w
+        // fragment parameters (lightLocal[1].w, [2].w): fog colour as a 24-bit integer, alpha reference
+        const MeshFSParams &mf = mp.second;
+        uint32_t fog24 = (uint32_t)lroundf(mf.fogR * 255.0f) | (uint32_t)lroundf(mf.fogG * 255.0f) << 8 |
+                         (uint32_t)lroundf(mf.fogB * 255.0f) << 16;
+        L.drawData[at + 9 * 4 + 3] = (float)fog24;
+        L.drawData[at + 10 * 4 + 3] = (float)lroundf(mf.p.alphaRef * 255.0f);
+        size_t vat = L.sverts.size(), iat = L.sindices.size();
+        CGraphicMesh *m = r.pMesh;
+        // meshes not indexed yet: a few ms per job (a scenery change brings thousands of
+        // models; until indexed they are drawn as they are)
+        if (!r.strip && !m->indexed && r.firstVertex == 0 && r.vertexCount == m->staging.size() && indexNs < 2000000) {
+            uint64_t x0 = SDL_GetTicksNS();
+            BuildIndexed(m);
+            indexNs += SDL_GetTicksNS() - x0;
+        }
+        if (!r.strip && r.firstVertex == 0 && r.vertexCount == m->staging.size() && !m->unique.empty()) {
+            // the whole model (CVertex draws whole models): its unique vertices, indexed
+            L.sverts.insert(L.sverts.end(), m->unique.begin(), m->unique.end());
+            L.sindices.resize(iat + m->indices.size());
+            uint32_t *dst = &L.sindices[iat];
+            uint32_t base = (uint32_t)vat;
+            for (uint16_t ix : m->indices) *dst++ = base + ix;
+        } else if (!r.strip) {
+            const MeshVertex *src = &r.pMesh->staging[r.firstVertex];
+            L.sverts.resize(vat + r.vertexCount);
+            for (uint32_t k = 0; k < r.vertexCount; k++) L.sverts[vat + k] = Pack(src[k]);
+        } else {
+            size_t total = 0;
+            for (uint32_t k = 0; k < r.strips; k++) total += (size_t)(j.stripRuns[r.stripFirst + k].second - 2) * 3;
+            L.sverts.resize(vat + total);
+            PreVertex *dst = &L.sverts[vat];
+            for (uint32_t k = 0; k < r.strips; k++) {
+                const auto &run = j.stripRuns[r.stripFirst + k];
+                const MeshVertex *src = &r.pMesh->staging[run.first];
+                for (uint32_t i = 0; i + 2 < run.second; i++) {     // keep winding and the last (provoking) vertex
+                    *dst++ = Pack(src[(i & 1) ? i + 1 : i]);
+                    *dst++ = Pack(src[(i & 1) ? i : i + 1]);
+                    *dst++ = Pack(src[i + 2]);
+                }
+            }
+        }
+        size_t added = L.sverts.size() - vat;
+        L.sslots.resize(vat + added, (uint8_t)slot);
+        if (L.sindices.size() == iat) {            // not indexed above: the vertices in order
+            L.sindices.resize(iat + added);
+            for (size_t k = 0; k < added; k++) L.sindices[iat + k] = (uint32_t)(vat + k);
+        }
+        it.count += (uint32_t)(L.sindices.size() - iat);
+        it.vlast = (uint32_t)L.sverts.size() - 1;  // an item's vertices are contiguous
+    };
+    const FSParams *last2D = nullptr;
+    uint32_t last2DBlock = 0;
+    std::vector<uint32_t> run;
+    struct SortKey { uint64_t k1, k2; uint32_t idx; };
+    std::vector<SortKey> sortKeys;
+    size_t lastBatched = ~(size_t)0;   // draw index emitted last, when it was batched (in-order merging)
+    for (size_t i = 0; i < j.draws.size();) {
+        const DrawCmd &d = j.draws[i];
+        if (d.pMesh && d.pre && sortable(d)) {
+            run.clear();
+            size_t e = i;
+            while (e < j.draws.size() && j.draws[e].pMesh && sortable(j.draws[e])) run.push_back((uint32_t)e++);
+            // sort by a precomputed key (program and pipeline key, then a hash of the rest); ties keep the
+            // recorded order. Merging below still compares exactly, so a hash collision only
+            // costs a merge.
+            sortKeys.clear();
+            for (uint32_t di : run) {
+                const DrawCmd &r = j.draws[di];
+                uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t)TexKey(r.pTex);
+                auto mix = [&](uint64_t v) { h ^= v; h *= 0xff51afd7ed558ccdull; h ^= h >> 32; };
+                mix(r.samplerKey);
+                uint64_t sc[2]; memcpy(sc, &r.scissor, sizeof(sc)); mix(sc[0]); mix(sc[1]);
+                const uint8_t *fp = reinterpret_cast<const uint8_t *>(&j.meshParams[r.meshParams].second);
+                for (size_t o = 0; o + 8 <= sizeof(MeshFSParams); o += 8) { uint64_t w; memcpy(&w, fp + o, 8); mix(w); }
+                // program first (the most expensive switch), then the fixed-function state
+                const MeshFSParams &mf = j.meshParams[r.meshParams].second;
+                uint64_t prog = ProgramKey(true, (r.pipeKey >> 23) & 1, mf.p, mf.fogOn, true);
+                sortKeys.push_back({prog << 32 | (r.pipeKey & 0xffffffffull), h, di});
+            }
+            std::sort(sortKeys.begin(), sortKeys.end(), [](const SortKey &a, const SortKey &b) {
+                return a.k1 != b.k1 ? a.k1 < b.k1 : a.k2 != b.k2 ? a.k2 < b.k2 : a.idx < b.idx;
+            });
+            for (size_t k = 0; k < run.size(); k++) run[k] = sortKeys[k].idx;
+            for (size_t k = 0; k < run.size(); k++) {
+                const DrawCmd &r = j.draws[run[k]];
+                L.meshDraws++; L.meshVerts += r.vertexCount;
+                emitBatched(run[k], k > 0 && cmpKey(run[k - 1], run[k]) == 0);
+            }
+            lastBatched = ~(size_t)0;
+            i = e;
+            continue;
+        }
+        if (d.pMesh) { L.meshDraws++; L.meshVerts += d.vertexCount; }
+        if (d.pMesh && d.pre) {
+            emitBatched((uint32_t)i, lastBatched + 1 == i && cmpKey((uint32_t)lastBatched, (uint32_t)i) == 0);
+            lastBatched = i;
+            i++;
+            continue;
+        }
+        lastBatched = ~(size_t)0;
+        if (d.pMesh) {
+            items.push_back({(uint32_t)i, meshBlockFor(d), d.firstVertex, d.vertexCount, 0, 1});
+        } else {
+            if (!last2D || memcmp(last2D, &d.fs, sizeof(FSParams))) {
+                ParamBlock *b = NewBlock(L.blockData, last2DBlock);
+                FillBlockFS(*b, d.fs);
+                b->target[0] = (float)rt.nWidth;
+                b->target[1] = (float)rt.nHeight;
+                last2D = &d.fs;
+            }
+            // consecutive triangle lists that differ only in arrayed textures of one array
+            // (the layer is per vertex) continue the previous item
+            if (!items.empty() && items.back().kind == 0 && (d.pipeKey & 7) == TRIANGLELIST) {
+                Item &pi = items.back();
+                const DrawCmd &pd = j.draws[pi.draw];
+                if (pi.block == last2DBlock && pd.pipeKey == d.pipeKey && TexKey(pd.pTex) == TexKey(d.pTex) &&
+                    pd.samplerKey == d.samplerKey && pi.first + pi.count == d.firstVertex &&
+                    !memcmp(&pd.scissor, &d.scissor, sizeof(SDL_Rect))) {
+                    pi.count += d.vertexCount;
+                    i++;
+                    continue;
+                }
+            }
+            items.push_back({(uint32_t)i, last2DBlock, d.firstVertex, d.vertexCount, 0, 0});
+        }
+        i++;
+    }
+    if (L.blockData.empty()) { uint32_t idx; NewBlock(L.blockData, idx); }    // something to bind for kAnyBlock
+    if (!L.sverts.empty()) drawRoom(g->batchSlots * kSlotBytes / 4);     // the last window's full binding range
+    L.ins = rt_thread_instructions() - ins0;
+    L.ns = SDL_GetTicksNS() - tl0;
+    L.built = true;
 }
 
 // The GL work of a job: uploads, then the recorded draws in order. Render thread.
@@ -2251,236 +2553,27 @@ static void Execute(Job &j)
             }
             gl.BufferSubData(GL_ARRAY_BUFFER, 0, vbytes, j.verts.data());
         }
-        // The draw list. Mesh draws get a parameter block per parameter set. Batched mesh draws are
-        // copied into a vertex stream in drawing order; runs of order-independent draws
-        // ("sortable": depth test and writes on, opaque or alpha-tested over-blending) are stably
-        // sorted by everything that affects their pixels, and equal neighbours share one draw call
-        // (up to kBatchSlots draws, whose vertex-shader constants are in the Draws uniform buffer).
-        uint64_t ins0 = rt_thread_instructions(), tl0 = SDL_GetTicksNS();
-        struct Item { uint32_t draw, block, first, count, window; uint8_t kind; uint32_t vfirst = 0, vlast = 0; };    // kind: 0 2D, 1 mesh, 2 batch
-        constexpr uint32_t kAnyBlock = ~1u;         // the item's shaders read no parameter block
-        std::vector<Item> items;
-        items.reserve(j.draws.size());
-        g->blockData.clear();
-        g->sverts.clear();
-        g->sslots.clear();
-        g->sindices.clear();
-        g->drawUsed = 0;
-        auto drawRoom = [&](size_t floats) {        // capacity without zero-filling each append
-            if (g->drawUsed + floats > g->drawData.size())
-                g->drawData.resize(SDL_max(g->drawUsed + floats, g->drawData.size() * 2 + 4096));
-        };
-        std::vector<uint32_t> meshBlock(j.meshParams.size(), ~0u);
-        auto meshBlockFor = [&](const DrawCmd &d) {
-            // unbatched draws of arrayed textures carry the layer in the block (lightLocal[0].w):
-            // a block per draw then, as parameter sets do not include the texture
-            uint32_t own = ~0u;
-            bool layered = !d.pre && d.pTex && d.pTex->arr;
-            uint32_t &mb = layered ? own : meshBlock[d.meshParams];
-            if (mb == ~0u) {
-                const auto &mp = j.meshParams[d.meshParams];
-                ParamBlock *b = NewBlock(mb);
-                memcpy(b->vs, mp.first.v, sizeof(b->vs));
-                FillBlockFS(*b, mp.second.p);
-                b->f3[1] = mp.first.kind;
-                b->fog[0] = mp.second.fogR; b->fog[1] = mp.second.fogG; b->fog[2] = mp.second.fogB;
-                if (layered) b->vs[8][3] = d.pTex->layer;
-            }
-            return mb;
-        };
-        auto sortable = [&](const DrawCmd &c) {
-            uint64_t k = c.pipeKey;
-            if (!c.pre || !(k & (1ull << 15)) || !(k & (1ull << 16)) || (k >> 25 & 15)) return false;
-            uint32_t zf = (k >> 17) & 15;
-            if (zf != CMP_LESS && zf != CMP_LESSEQUAL) return false;
-            if (!(k & (1ull << 3))) return true;
-            const FSParams &f = j.meshParams[c.meshParams].second.p;
-            return (k >> 4 & 15) == BLEND_SRCALPHA && (k >> 8 & 15) == BLEND_INVSRCALPHA && f.alphaTest &&
-                   f.alphaFunc == CMP_GREATEREQUAL && f.alphaRef >= 0.5f;
-        };
-        auto cmpKey = [&](uint32_t a, uint32_t b) -> int {
-            const DrawCmd &x = j.draws[a], &y = j.draws[b];
-            if (x.pipeKey != y.pipeKey) return x.pipeKey < y.pipeKey ? -1 : 1;
-            if (TexKey(x.pTex) != TexKey(y.pTex)) return TexKey(x.pTex) < TexKey(y.pTex) ? -1 : 1;
-            if (x.samplerKey != y.samplerKey) return x.samplerKey < y.samplerKey ? -1 : 1;
-            if (int c = memcmp(&x.scissor, &y.scissor, sizeof(SDL_Rect))) return c;
-            return memcmp(&j.meshParams[x.meshParams].second, &j.meshParams[y.meshParams].second, sizeof(MeshFSParams));
-        };
-        // appends draw r to the stream (and its constants to a new slot); continues the last item
-        // when `merge` and the slot still fits its window
-        // Item::window is the window's byte offset in drawData (aligned for glBindBufferRange)
-        // Draw slots are allocated in windows of batchSlots; consecutive items share a window (one
-        // BindBufferRange per window, not per item). Everything a batched draw's shaders read
-        // is in its slot (only the paletted path still reads its parameter block), so the items
-        // of a window rebind nothing but program, state and texture.
-        size_t curWindow = ~(size_t)0;
-        uint64_t indexNs = 0;                       // time spent in BuildIndexed by this job
-        auto emitBatched = [&](uint32_t di, bool merge) {
-            const DrawCmd &r = j.draws[di];
-            size_t at = g->drawUsed;
-            if (curWindow == ~(size_t)0 || (at * 4 - curWindow) / kSlotBytes >= g->batchSlots) {
-                size_t aligned = (at * 4 + g->uboAlign - 1) / g->uboAlign * g->uboAlign;
-                drawRoom(aligned / 4 - at);
-                g->drawUsed = at = aligned / 4;
-                curWindow = aligned;
-                merge = false;                      // an item draws from one window
-            }
-            if (!merge || items.empty() || items.back().kind != 2) {
-                uint32_t block = j.meshParams[r.meshParams].second.p.mode == 2 ? meshBlockFor(r) : kAnyBlock;
-                items.push_back({di, block, (uint32_t)g->sindices.size(), 0, (uint32_t)curWindow, 2, (uint32_t)g->sverts.size(), 0});
-            }
-            Item &it = items.back();
-            uint32_t slot = (uint32_t)((at * 4 - it.window) / kSlotBytes);
-            const auto &mp = j.meshParams[r.meshParams];
-            drawRoom(kSlotBytes / 4);
-            g->drawUsed = at + kSlotBytes / 4;
-            memcpy(&g->drawData[at], mp.first.v, sizeof(mp.first.v));
-            g->drawData[at + 3] = (float)mp.first.kind;        // fog.w
-            g->drawData[at + 8 * 4 + 3] = r.pTex && r.pTex->arr ? (float)r.pTex->layer : 0.0f;   // lightLocal[0].w
-            // fragment parameters (lightLocal[1].w, [2].w): fog colour as a 24-bit integer, alpha reference
-            const MeshFSParams &mf = mp.second;
-            uint32_t fog24 = (uint32_t)lroundf(mf.fogR * 255.0f) | (uint32_t)lroundf(mf.fogG * 255.0f) << 8 |
-                             (uint32_t)lroundf(mf.fogB * 255.0f) << 16;
-            g->drawData[at + 9 * 4 + 3] = (float)fog24;
-            g->drawData[at + 10 * 4 + 3] = (float)lroundf(mf.p.alphaRef * 255.0f);
-            size_t vat = g->sverts.size(), iat = g->sindices.size();
-            CGraphicMesh *m = r.pMesh;
-            // meshes not indexed yet: a few ms per job (a scenery change brings thousands of
-            // models; until indexed they are drawn as they are)
-            if (!r.strip && !m->indexed && r.firstVertex == 0 && r.vertexCount == m->staging.size() && indexNs < 2000000) {
-                uint64_t x0 = SDL_GetTicksNS();
-                BuildIndexed(m);
-                indexNs += SDL_GetTicksNS() - x0;
-            }
-            if (!r.strip && r.firstVertex == 0 && r.vertexCount == m->staging.size() && !m->unique.empty()) {
-                // the whole model (CVertex draws whole models): its unique vertices, indexed
-                g->sverts.insert(g->sverts.end(), m->unique.begin(), m->unique.end());
-                g->sindices.resize(iat + m->indices.size());
-                uint32_t *dst = &g->sindices[iat];
-                uint32_t base = (uint32_t)vat;
-                for (uint16_t ix : m->indices) *dst++ = base + ix;
-            } else if (!r.strip) {
-                const MeshVertex *src = &r.pMesh->staging[r.firstVertex];
-                g->sverts.insert(g->sverts.end(), src, src + r.vertexCount);
-            } else {
-                size_t total = 0;
-                for (uint32_t k = 0; k < r.strips; k++) total += (size_t)(j.stripRuns[r.stripFirst + k].second - 2) * 3;
-                g->sverts.resize(vat + total);
-                MeshVertex *dst = &g->sverts[vat];
-                for (uint32_t k = 0; k < r.strips; k++) {
-                    const auto &run = j.stripRuns[r.stripFirst + k];
-                    const MeshVertex *src = &r.pMesh->staging[run.first];
-                    for (uint32_t i = 0; i + 2 < run.second; i++) {     // keep winding and the last (provoking) vertex
-                        *dst++ = src[(i & 1) ? i + 1 : i];
-                        *dst++ = src[(i & 1) ? i : i + 1];
-                        *dst++ = src[i + 2];
-                    }
-                }
-            }
-            size_t added = g->sverts.size() - vat;
-            g->sslots.resize(vat + added, (uint8_t)slot);
-            if (g->sindices.size() == iat) {            // not indexed above: the vertices in order
-                g->sindices.resize(iat + added);
-                for (size_t k = 0; k < added; k++) g->sindices[iat + k] = (uint32_t)(vat + k);
-            }
-            it.count += (uint32_t)(g->sindices.size() - iat);
-            it.vlast = (uint32_t)g->sverts.size() - 1;  // an item's vertices are contiguous
-        };
-        const FSParams *last2D = nullptr;
-        uint32_t last2DBlock = 0;
-        std::vector<uint32_t> run;
-        struct SortKey { uint64_t k1, k2; uint32_t idx; };
-        std::vector<SortKey> sortKeys;
-        size_t lastBatched = ~(size_t)0;   // draw index emitted last, when it was batched (in-order merging)
-        for (size_t i = 0; i < j.draws.size();) {
-            const DrawCmd &d = j.draws[i];
-            if (d.pMesh && d.pre && sortable(d)) {
-                run.clear();
-                size_t e = i;
-                while (e < j.draws.size() && j.draws[e].pMesh && sortable(j.draws[e])) run.push_back((uint32_t)e++);
-                // sort by a precomputed key (program and pipeline key, then a hash of the rest); ties keep the
-                // recorded order. Merging below still compares exactly, so a hash collision only
-                // costs a merge.
-                sortKeys.clear();
-                for (uint32_t di : run) {
-                    const DrawCmd &r = j.draws[di];
-                    uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t)TexKey(r.pTex);
-                    auto mix = [&](uint64_t v) { h ^= v; h *= 0xff51afd7ed558ccdull; h ^= h >> 32; };
-                    mix(r.samplerKey);
-                    uint64_t sc[2]; memcpy(sc, &r.scissor, sizeof(sc)); mix(sc[0]); mix(sc[1]);
-                    const uint8_t *fp = reinterpret_cast<const uint8_t *>(&j.meshParams[r.meshParams].second);
-                    for (size_t o = 0; o + 8 <= sizeof(MeshFSParams); o += 8) { uint64_t w; memcpy(&w, fp + o, 8); mix(w); }
-                    // program first (the most expensive switch), then the fixed-function state
-                    const MeshFSParams &mf = j.meshParams[r.meshParams].second;
-                    uint64_t prog = ProgramKey(true, (r.pipeKey >> 23) & 1, mf.p, mf.fogOn, true);
-                    sortKeys.push_back({prog << 32 | (r.pipeKey & 0xffffffffull), h, di});
-                }
-                std::sort(sortKeys.begin(), sortKeys.end(), [](const SortKey &a, const SortKey &b) {
-                    return a.k1 != b.k1 ? a.k1 < b.k1 : a.k2 != b.k2 ? a.k2 < b.k2 : a.idx < b.idx;
-                });
-                for (size_t k = 0; k < run.size(); k++) run[k] = sortKeys[k].idx;
-                for (size_t k = 0; k < run.size(); k++) {
-                    const DrawCmd &r = j.draws[run[k]];
-                    g_traceMeshDraws++; g_traceMeshVerts += r.vertexCount;
-                    emitBatched(run[k], k > 0 && cmpKey(run[k - 1], run[k]) == 0);
-                }
-                lastBatched = ~(size_t)0;
-                i = e;
-                continue;
-            }
-            if (d.pMesh) { g_traceMeshDraws++; g_traceMeshVerts += d.vertexCount; }
-            if (d.pMesh && d.pre) {
-                emitBatched((uint32_t)i, lastBatched + 1 == i && cmpKey((uint32_t)lastBatched, (uint32_t)i) == 0);
-                lastBatched = i;
-                i++;
-                continue;
-            }
-            lastBatched = ~(size_t)0;
-            if (d.pMesh) {
-                items.push_back({(uint32_t)i, meshBlockFor(d), d.firstVertex, d.vertexCount, 0, 1});
-            } else {
-                if (!last2D || memcmp(last2D, &d.fs, sizeof(FSParams))) {
-                    ParamBlock *b = NewBlock(last2DBlock);
-                    FillBlockFS(*b, d.fs);
-                    b->target[0] = (float)rt.nWidth;
-                    b->target[1] = (float)rt.nHeight;
-                    last2D = &d.fs;
-                }
-                // consecutive triangle lists that differ only in arrayed textures of one array
-                // (the layer is per vertex) continue the previous item
-                if (!items.empty() && items.back().kind == 0 && (d.pipeKey & 7) == TRIANGLELIST) {
-                    Item &pi = items.back();
-                    const DrawCmd &pd = j.draws[pi.draw];
-                    if (pi.block == last2DBlock && pd.pipeKey == d.pipeKey && TexKey(pd.pTex) == TexKey(d.pTex) &&
-                        pd.samplerKey == d.samplerKey && pi.first + pi.count == d.firstVertex &&
-                        !memcmp(&pd.scissor, &d.scissor, sizeof(SDL_Rect))) {
-                        pi.count += d.vertexCount;
-                        i++;
-                        continue;
-                    }
-                }
-                items.push_back({(uint32_t)i, last2DBlock, d.firstVertex, d.vertexCount, 0, 0});
-            }
-            i++;
-        }
+        // the draw list: built by the list thread already when it runs (see ListMain)
+        Job::List &L = j.list;
+        if (!L.built) BuildList(j);
+        g_insList += L.ins; g_nsList += L.ns;
+        g->listFrameNs += L.ns;
+        g_traceMeshDraws += L.meshDraws; g_traceMeshVerts += L.meshVerts;
+        const std::vector<ListItem> &items = L.items;
         uint64_t ins1 = rt_thread_instructions(), tl1 = SDL_GetTicksNS();
-        g_insList += ins1 - ins0;
-        g_nsList += tl1 - tl0;
-        if (g->blockData.empty()) { uint32_t idx; NewBlock(idx); }    // something to bind for kAnyBlock
         gl.BindBuffer(GL_UNIFORM_BUFFER, g->ubo);
-        gl.BufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)g->blockData.size(), g->blockData.data(), GL_STREAM_DRAW);
-        if (!g->sverts.empty()) {
-            size_t pad = g->batchSlots * kSlotBytes / 4;    // the last window's full binding range
-            drawRoom(pad);
+        gl.BufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)L.blockData.size(), L.blockData.data(), GL_STREAM_DRAW);
+        if (!L.sverts.empty()) {
+            size_t pad = g->batchSlots * kSlotBytes / 4;    // the last window's full binding range (room made by BuildList)
             gl.BindBuffer(GL_UNIFORM_BUFFER, g->uboDraws);
-            gl.BufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)((g->drawUsed + pad) * 4), g->drawData.data(), GL_STREAM_DRAW);
+            gl.BufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)((L.drawUsed + pad) * 4), L.drawData.data(), GL_STREAM_DRAW);
             gl.BindBuffer(GL_ARRAY_BUFFER, g->preVB);
-            gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g->sverts.size() * sizeof(MeshVertex)), g->sverts.data(), GL_STREAM_DRAW);
+            gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(L.sverts.size() * sizeof(PreVertex)), L.sverts.data(), GL_STREAM_DRAW);
             gl.BindBuffer(GL_ARRAY_BUFFER, g->slotVB);
-            gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g->sslots.size(), g->sslots.data(), GL_STREAM_DRAW);
+            gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)L.sslots.size(), L.sslots.data(), GL_STREAM_DRAW);
             gl.BindVertexArray(g->vaoPre);              // the element buffer binding is vertex array state
             gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->indexVB);
-            gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(g->sindices.size() * 4), g->sindices.data(), GL_STREAM_DRAW);
+            gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(L.sindices.size() * 4), L.sindices.data(), GL_STREAM_DRAW);
         }
         uint64_t ins2 = rt_thread_instructions(), tl2 = SDL_GetTicksNS();
         g_insUpload += ins2 - ins1;
@@ -2499,11 +2592,25 @@ static void Execute(Job &j)
         SDL_Rect lastScissor = {}, lastMeshVp = {};
         int lastKind = -1;
         uint32_t lastWindow = ~0u;
-        for (const Item &it : items) {
+        for (const ListItem &it : items) {
             const DrawCmd &d = j.draws[it.draw];
             bool mesh = it.kind != 0;
             const FSParams &fs = mesh ? j.meshParams[d.meshParams].second.p : d.fs;
             bool fog = mesh && j.meshParams[d.meshParams].second.fogOn;
+            if (g_exp & 0x78) {                         // RECOMP_GL_EXP: leave out a class of draws (GPU cost split)
+                bool blended = (d.pipeKey >> 3) & 1, tested = fs.alphaTest && fs.alphaFunc != CMP_ALWAYS;
+                if (((g_exp & 8) && !mesh) || ((g_exp & 16) && mesh && blended) || ((g_exp & 32) && mesh && tested) ||
+                    ((g_exp & 64) && mesh && !blended && !tested)) continue;
+            }
+            if ((g_exp & 0x180) && !mesh) {             // 128: full-screen 2D quads only, 256: the other 2D draws
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                for (uint32_t k = 0; k < (uint32_t)it.count; k++) {
+                    const Vertex &w = j.verts[it.first + k];
+                    x0 = SDL_min(x0, w.x); y0 = SDL_min(y0, w.y); x1 = SDL_max(x1, w.x); y1 = SDL_max(y1, w.y);
+                }
+                bool full = (x1 - x0) * (y1 - y0) >= 0.9f * rt.nWidth * rt.nHeight;
+                if (((g_exp & 128) && full) || ((g_exp & 256) && !full)) continue;
+            }
             GLuint prog = GetProgram(ProgramKey(mesh, (d.pipeKey >> 23) & 1, fs, fog, it.kind == 2));
             if (!prog || CACHED_ENV("RECOMP_GL_NOSUBMIT")) continue;   // diagnostics: skip GL draw work
             if (prog != boundProg) { gl.UseProgram(prog); boundProg = prog; g_cProg++; }
@@ -2624,7 +2731,8 @@ static void Execute(Job &j)
         else Present(*j.scene, j.gamma);
         g->flushNs += t1 - t0;
         TraceFrame(g->flushNs, SDL_GetTicksNS() - t1);
-        g->flushNs = 0;
+        g->frameLoadNs = SDL_max(g->flushNs + g->gpuWaitFrameNs, g->listFrameNs);
+        g->flushNs = g->listFrameNs = g->gpuWaitFrameNs = 0;
     } else {
         g->flushNs += SDL_GetTicksNS() - t0;
     }
@@ -2640,6 +2748,31 @@ static void Enqueue(Job *j)
     g->queueCv.notify_all();
 }
 
+// The list thread: builds the draw lists of queued jobs (BuildList), in order, while the render
+// thread is still drawing the previous one. Per frame on the R36H at draw distance 1.00 the render
+// thread needed ~8 ms for the list, ~2 for uploads and ~9 for submitting (mostly in the driver,
+// ~20 us per draw call): over a 60 Hz frame together, not apart. Not with texture arrays (their
+// layers are assigned by the render thread's uploads). RECOMP_GL_LISTTHREAD=0 turns it off.
+static void ListMain()
+{
+    NameThread("gl-list");
+    std::unique_lock<std::mutex> lk(g->queueLock);
+    for (;;) {
+        Job *j = nullptr;
+        g->queueCv.wait(lk, [&] {
+            for (Job *q : g->queue) if (q->listState == 0) { j = q; return true; }
+            return g->quit;
+        });
+        if (!j) break;
+        j->listState = 1;
+        lk.unlock();
+        if (!j->draws.empty() || j->clearColor || j->clearDepth) BuildList(*j);
+        lk.lock();
+        j->listState = 2;
+        g->queueCv.notify_all();
+    }
+}
+
 // The render thread: GL setup, then jobs in order until Term().
 static void RenderMain()
 {
@@ -2649,6 +2782,10 @@ static void RenderMain()
         std::lock_guard<std::mutex> lk(g->queueLock);
         g->setupDone = true;
         g->setupOk = ok;
+        // started before any job is taken: jobs are built by one thread only (BuildIndexed)
+        const char *lt = getenv("RECOMP_GL_LISTTHREAD");
+        g->listThreaded = ok && !g->texArrays && !(lt && atoi(lt) == 0);
+        if (g->listThreaded) g->listThread = std::thread(ListMain);
     }
     g->queueCv.notify_all();
     for (;;) {
@@ -2658,11 +2795,13 @@ static void RenderMain()
         {
             auto standIns = [ok] { return ok && g->earlyUploads && g->standInsMade < kStandIns; };
             std::unique_lock<std::mutex> lk(g->queueLock);
-            g->queueCv.wait(lk, [&] { return !g->queue.empty() || !g->upQueue.empty() || g->quit || standIns(); });
-            if (!g->queue.empty()) {
+            // with the list thread, the next job is taken once its draw list is built
+            auto jobReady = [] { return !g->queue.empty() && (!g->listThreaded || g->queue.front()->listState == 2); };
+            g->queueCv.wait(lk, [&] { return jobReady() || !g->upQueue.empty() || (g->quit && g->queue.empty()) || standIns(); });
+            if (jobReady()) {
                 j = g->queue.front();
                 g->queue.pop_front();
-            } else if (g->quit) {
+            } else if (g->quit && g->queue.empty()) {
                 break;
             } else if (!g->upQueue.empty()) {       // no job waiting: a texture upload
                 r = g->upQueue.front();
@@ -2771,6 +2910,71 @@ static void FillTexture(DrawCmd &d)
     }
 }
 
+// HUD sprites: about 3 screens of textured, blended 2D quads per frame while driving, 61% of
+// their texels fully transparent (Osaka Loop). A quad whose transparent texels cannot change a
+// pixel (source weighted by alpha, alpha taken from the texture) is cropped to the box of the
+// texels with alpha > 0 plus one texel (bilinear filtering), its texture coordinates mapped as
+// before, so the pixels it still covers get the same values. Boxes are cached per texture region
+// and texture version. Returns false when nothing in the region is visible (draw dropped).
+// RECOMP_GL_CROPQUADS=0 disables it.
+static bool CropQuad(Vertex *v, CGraphicTexture &t)
+{
+    float x0 = v[0].x, x1 = x0, y0 = v[0].y, y1 = y0;
+    for (int i = 1; i < 6; i++) {
+        if (v[i].z != v[0].z || v[i].rhw != v[0].rhw || v[i].color != v[0].color) return true;
+        x0 = SDL_min(x0, v[i].x); x1 = SDL_max(x1, v[i].x); y0 = SDL_min(y0, v[i].y); y1 = SDL_max(y1, v[i].y);
+    }
+    if (x1 - x0 < 8 || y1 - y0 < 8) return true;            // small sprites: not worth it
+    // an axis-aligned rectangle whose u depends only on x and v only on y
+    float uX[2] = {NAN, NAN}, vY[2] = {NAN, NAN};
+    for (int i = 0; i < 6; i++) {
+        int ix = v[i].x == x0 ? 0 : v[i].x == x1 ? 1 : -1, iy = v[i].y == y0 ? 0 : v[i].y == y1 ? 1 : -1;
+        if (ix < 0 || iy < 0) return true;
+        if (std::isnan(uX[ix])) uX[ix] = v[i].u; else if (uX[ix] != v[i].u) return true;
+        if (std::isnan(vY[iy])) vY[iy] = v[i].v; else if (vY[iy] != v[i].v) return true;
+    }
+    if (std::isnan(uX[0]) || std::isnan(uX[1]) || std::isnan(vY[0]) || std::isnan(vY[1]) || uX[0] == uX[1] || vY[0] == vY[1]) return true;
+    float tu0 = SDL_min(uX[0], uX[1]) * t.nUVWidth, tu1 = SDL_max(uX[0], uX[1]) * t.nUVWidth;
+    float tv0 = SDL_min(vY[0], vY[1]) * t.nUVHeight, tv1 = SDL_max(vY[0], vY[1]) * t.nUVHeight;
+    if (tu0 < 0 || tv0 < 0 || tu1 > t.nWidth || tv1 > t.nHeight) return true;   // repeats or beyond the texels
+    int ix0 = (int)floorf(tu0), ix1 = (int)ceilf(tu1), iy0 = (int)floorf(tv0), iy1 = (int)ceilf(tv1);
+    struct Box { int x0, y0, x1, y1; };
+    static std::map<std::tuple<uint64_t, uint32_t, int, int, int, int>, Box> cache;
+    auto key = std::make_tuple(t.uid, t.contentGen, ix0, iy0, ix1, iy1);
+    auto it = cache.find(key);
+    Box b;
+    if (it != cache.end()) {
+        b = it->second;
+    } else {
+        b = {1 << 30, 1 << 30, -1, -1};
+        for (int y = iy0; y < iy1; y++) {
+            const uint8_t *row = &t.staging[((size_t)y * t.nWidth) * 4 + 3];
+            for (int x = ix0; x < ix1; x++)
+                if (row[(size_t)x * 4]) { b.x0 = SDL_min(b.x0, x); b.x1 = SDL_max(b.x1, x + 1); b.y0 = SDL_min(b.y0, y); b.y1 = SDL_max(b.y1, y + 1); }
+        }
+        if (cache.size() > 8192) cache.clear();
+        cache[key] = b;
+    }
+    if (b.x1 < 0) return false;                                // all transparent
+    float nu0 = SDL_max(tu0, b.x0 - 1.0f), nu1 = SDL_min(tu1, b.x1 + 1.0f);
+    float nv0 = SDL_max(tv0, b.y0 - 1.0f), nv1 = SDL_min(tv1, b.y1 + 1.0f);
+    if ((nu1 - nu0) * (nv1 - nv0) > 0.9f * (tu1 - tu0) * (tv1 - tv0)) return true;
+    // texel coordinate -> screen coordinate along each axis (u may run against x)
+    auto xOfU = [&](float tu) { return x0 + (tu / t.nUVWidth - uX[0]) / (uX[1] - uX[0]) * (x1 - x0); };
+    auto yOfV = [&](float tv) { return y0 + (tv / t.nUVHeight - vY[0]) / (vY[1] - vY[0]) * (y1 - y0); };
+    float nx0 = SDL_min(xOfU(nu0), xOfU(nu1)), nx1 = SDL_max(xOfU(nu0), xOfU(nu1));
+    float ny0 = SDL_min(yOfV(nv0), yOfV(nv1)), ny1 = SDL_max(yOfV(nv0), yOfV(nv1));
+    nx0 = SDL_max(nx0, x0); nx1 = SDL_min(nx1, x1); ny0 = SDL_max(ny0, y0); ny1 = SDL_min(ny1, y1);
+    auto uOfX = [&](float x) { return uX[0] + (x - x0) / (x1 - x0) * (uX[1] - uX[0]); };
+    auto vOfY = [&](float y) { return vY[0] + (y - y0) / (y1 - y0) * (vY[1] - vY[0]); };
+    for (int i = 0; i < 6; i++) {
+        float nx = v[i].x == x0 ? nx0 : nx1, ny = v[i].y == y0 ? ny0 : ny1;
+        v[i].x = nx; v[i].u = uOfX(nx);
+        v[i].y = ny; v[i].v = vOfY(ny);
+    }
+    return true;
+}
+
 static bool Record(const Vertex *v, uint32_t n)
 {
     State &s = g->st;
@@ -2804,6 +3008,17 @@ static bool Record(const Vertex *v, uint32_t n)
 
     d.pipeKey = PipeKey(topo, s);
     FillTexture(d);
+    static const bool cropQuads = !getenv("RECOMP_GL_CROPQUADS") || atoi(getenv("RECOMP_GL_CROPQUADS")) != 0;
+    if (cropQuads && d.pTex && topo == TRIANGLELIST && d.vertexCount == 6 && s.blendEnable && s.srcBlend == BLEND_SRCALPHA &&
+        (s.dstBlend == BLEND_INVSRCALPHA || s.dstBlend == BLEND_ONE) &&
+        (s.alphaOp == TOP_SELECTARG1 || s.alphaOp == TOP_MODULATE || s.alphaOp == TOP_MODULATE2X) &&
+        !d.pTex->bRenderTarget && !d.pTex->arrayed && d.pTex->nFormat == TEXFMT_BGRA8 &&
+        d.pTex->staging.size() >= (size_t)d.pTex->nWidth * d.pTex->nHeight * 4) {
+        if (!CropQuad(&g->verts[d.firstVertex], *d.pTex)) {      // nothing visible
+            g->verts.resize(d.firstVertex);
+            return true;
+        }
+    }
     if (topo == TRIANGLELIST && !g->draws.empty()) {
         DrawCmd &last = g->draws.back();
         if (!last.pMesh && last.pipeKey == d.pipeKey && last.pTex == d.pTex && last.samplerKey == d.samplerKey &&
@@ -2937,6 +3152,7 @@ void CGraphic::Term()
         }
         g->queueCv.notify_all();
         g->thread.join();
+        if (g->listThread.joinable()) g->listThread.join();
     }
     if (g->warmCtx) SDL_GL_DestroyContext(g->warmCtx);
     if (g->renderCtx) SDL_GL_DestroyContext(g->renderCtx);
@@ -3034,6 +3250,70 @@ static void DrawFpsCounter(PresentRes &r, int sh)
     float pp[4] = {1.0f, 0.0f, 0.0f, (float)usedW / kW};
     gl.Uniform4fv(r.uPresent, 1, pp);
     gl.Uniform1f(r.uScaleY, 1.0f);
+    gl.Uniform1f(r.uLutOn, 0.0f);
+    float full[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    gl.Uniform4fv(r.uClamp, 1, full);
+    gl.BindSampler(0, r.samplerNearest);
+    gl.DrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// CGraphic::SetOverlay: the image (rows top-down) and its version, drawn by DrawOverlay
+static struct {
+    std::mutex lock;
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    uint32_t version = 0;
+} g_overlay;
+
+void CGraphic::SetOverlay(const uint8_t *pRGBA, int nWidth, int nHeight)
+{
+    std::lock_guard<std::mutex> lk(g_overlay.lock);
+    if (!pRGBA || nWidth <= 0 || nHeight <= 0) { g_overlay.w = g_overlay.h = 0; return; }
+    g_overlay.px.assign(pRGBA, pRGBA + (size_t)nWidth * nHeight * 4);
+    g_overlay.w = nWidth;
+    g_overlay.h = nHeight;
+    g_overlay.version++;
+}
+
+bool CGraphic::HasFpsCounter() { return true; }
+bool CGraphic::FpsCounter() { return g_cfgFps != 0; }
+void CGraphic::SetFpsCounter(bool bOn) { g_cfgFps = bOn; }
+
+// The overlay, centred at the largest integer scale that leaves a margin, nearest-sampled.
+static void DrawOverlay(PresentRes &r, int sw, int sh)
+{
+    std::vector<uint8_t> px;
+    int w, h;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lk(g_overlay.lock);
+        if (!g_overlay.w) return;
+        w = g_overlay.w;
+        h = g_overlay.h;
+        changed = !r.overlayTex || r.overlayVersion != g_overlay.version;
+        if (changed) px = g_overlay.px;
+        r.overlayVersion = g_overlay.version;
+    }
+    if (!r.overlayTex) {
+        gl.GenTextures(1, &r.overlayTex);
+        gl.BindTexture(GL_TEXTURE_2D, r.overlayTex);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    gl.BindTexture(GL_TEXTURE_2D, r.overlayTex);
+    if (changed) {                                  // GL rows bottom-up
+        std::vector<uint8_t> flipped(px.size());
+        for (int y = 0; y < h; y++) memcpy(&flipped[(size_t)y * w * 4], &px[(size_t)(h - 1 - y) * w * 4], (size_t)w * 4);
+        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+    }
+    int scale = SDL_max(1, SDL_min(sw * 15 / 16 / w, sh * 15 / 16 / h));
+    gl.Viewport((sw - w * scale) / 2, (sh - h * scale) / 2, w * scale, h * scale);
+    float pp[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    gl.Uniform4fv(r.uPresent, 1, pp);
+    gl.Uniform1f(r.uScaleY, 1.0f);
+    gl.Uniform1f(r.uLutOn, 0.0f);
+    float full[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    gl.Uniform4fv(r.uClamp, 1, full);
     gl.BindSampler(0, r.samplerNearest);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -3062,12 +3342,29 @@ static void BlitToWindow(PresentRes &r, GLuint sceneTex, uint32_t sceneW, uint32
     float pp[4] = {1.0f / (gamma > 0 ? gamma : 1.0f), u0, v0, us};
     gl.Uniform4fv(r.uPresent, 1, pp);
     gl.Uniform1f(r.uScaleY, vs);
+    // sampling stays half a texel inside the shown part: bilinear filtering at the screen edge
+    // would otherwise mix in the overscan margin (stripes at the edges with crop)
+    float hu = 0.5f / w, hv = 0.5f / h, clampUV[4] = {u0 + hu, v0 + hv, u0 + us - hu, v0 + vs - hv};
+    gl.Uniform4fv(r.uClamp, 1, clampUV);
+    bool lutOn = gamma > 0 && gamma != 1.0f;
+    gl.Uniform1f(r.uLutOn, lutOn ? 1.0f : 0.0f);
+    gl.ActiveTexture(GL_TEXTURE0 + 2);
+    gl.BindTexture(GL_TEXTURE_2D, r.lut);
+    gl.BindSampler(2, r.samplerLinear);
+    if (lutOn && gamma != r.lutGamma) {             // (re)build the gamma table
+        uint8_t t[256];
+        for (int i = 0; i < 256; i++) t[i] = (uint8_t)SDL_clamp(lroundf(255.0f * powf(i / 255.0f, 1.0f / gamma)), 0, 255);
+        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RED, GL_UNSIGNED_BYTE, t);
+        r.lutGamma = gamma;
+    }
     gl.ActiveTexture(GL_TEXTURE0);
     gl.BindTexture(GL_TEXTURE_2D, sceneTex);
     gl.BindSampler(0, r.samplerLinear);
     gl.BindVertexArray(r.vao);
     if (!(g_exp & 4)) gl.DrawArrays(GL_TRIANGLES, 0, 3);
     if (g_cfgFps) DrawFpsCounter(r, sh);
+    DrawOverlay(r, sw, sh);
     // test hook: RECOMP_SHOT_WINDOW=<seconds> saves the final window image once (snapshot/window.bmp)
     static const char *shotWin = getenv("RECOMP_SHOT_WINDOW");
     static uint64_t start = SDL_GetTicksNS();
@@ -3153,6 +3450,7 @@ static void HandOff(CGraphicTexture &scene, float gamma)
     g->frameFence = done;
     uint64_t w1 = SDL_GetTicksNS();
     g->frameWaitNs += w1 - w0;
+    g->gpuWaitFrameNs = w1 - w0;
     g_nsPresent += w0 - tp1;
 }
 
@@ -3331,10 +3629,14 @@ bool CGraphic::EndFrame(bool bSnapshotKey)
     return true;
 }
 
+bool CGraphic::Threaded() { return g && g->threaded; }
+
 bool CGraphic::FrameInFlight()
 {
     return g && g->threaded && g->presentsDone != g->presentsQueued;
 }
+
+uint64_t CGraphic::FrameLoadNs() { return g ? (uint64_t)g->frameLoadNs : 0; }
 
 uint64_t CGraphic::FrameBusyNs()
 {
@@ -3423,6 +3725,7 @@ void CGraphic::UnlockTexture(CGraphicTexture *pTex)
     std::lock_guard<RecLock> lock(g->lock);
     if (!pTex->bDirty) Flush();
     AnalyzeAlpha(pTex);
+    pTex->contentGen++;
     MarkDirty(pTex);
     if (g->earlyUploads && !pTex->arrayed) IssueUpload(pTex);
 }
@@ -3850,6 +4153,31 @@ void CGraphic::DestroyMesh(CGraphicMesh *pMesh)
     g_stats.liveMeshes--; g_stats.meshDestroys++;
 }
 
+// Equality of plain data without a library call (memcmp is not inlined for these sizes; ~2500
+// calls per frame on the game thread). `n` is a multiple of 4.
+static inline bool SameBytes(const void *a, const void *b, size_t n)
+{
+    const uint8_t *x = static_cast<const uint8_t *>(a), *y = static_cast<const uint8_t *>(b);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t u, v;
+        memcpy(&u, x + i, 8); memcpy(&v, y + i, 8);
+        if (u != v) return false;
+    }
+    for (; i < n; i += 4) {
+        uint32_t u, v;
+        memcpy(&u, x + i, 4); memcpy(&v, y + i, 4);
+        if (u != v) return false;
+    }
+    return true;
+}
+
+// MeshConstants: the model's matrix first (differs from the previous model's almost always)
+static inline bool SameConstants(const MeshConstants &a, const MeshConstants &b)
+{
+    return SameBytes(a.localToScreen, b.localToScreen, sizeof(a.localToScreen)) && SameBytes(&a, &b, sizeof(MeshConstants));
+}
+
 // DrawMesh with g->lock held. `sameCall`: an earlier strip of the same DrawMeshStrips call came
 // before, so state, texture and constants are known to equal lastStrip's (no comparison needed).
 // `trusted`: the range is known to fit the mesh (DrawMeshStrips: CVertex built the strips from it),
@@ -3891,8 +4219,8 @@ static bool DrawMeshLocked(CGraphicMesh *pMesh, MeshShader shader, PrimitiveType
     if (g->batching && type == TRIANGLESTRIP && !g->draws.empty() && g->draws.back().strip &&
         ls.mesh == pMesh && ls.end == nFirst && ls.cull == nCull &&
         (sameCall || (ls.shader == (int)shader && ls.viewport == g->nViewport && ls.textured == g->textured &&
-                      ls.tex == g->pCurTex && ls.palette == g->curPalette && !memcmp(&ls.st, &g->st, sizeof(State)) &&
-                      !memcmp(&ls.c, &c, sizeof(MeshConstants))))) {
+                      ls.tex == g->pCurTex && ls.palette == g->curPalette && SameConstants(ls.c, c) &&
+                      SameBytes(&ls.st, &g->st, sizeof(State))))) {
         DrawCmd &last = g->draws.back();
         if (count >= 3) { g->stripRuns.push_back({nFirst, count}); last.strips++; last.vertexCount += count; }
         ls.end = nFirst + count;
@@ -3938,7 +4266,10 @@ static bool DrawMeshLocked(CGraphicMesh *pMesh, MeshShader shader, PrimitiveType
     }
     d.pipeKey = PipeKey(topo, s) | kKeyMesh;
 
-    MeshVSParams vs = {};
+    // the parameter set is written in place and dropped again when it repeats the previous one
+    auto &mps = g->meshParams;
+    mps.emplace_back();
+    MeshVSParams &vs = mps.back().first;
     memcpy(vs.v[0], c.fog, 16);
     memcpy(vs.v[1], c.lightColor, 48);
     memcpy(vs.v[4], c.localToScreen, 64);
@@ -3946,18 +4277,19 @@ static bool DrawMeshLocked(CGraphicMesh *pMesh, MeshShader shader, PrimitiveType
     memcpy(vs.v[11], c.baseColor, 16);
     memcpy(vs.v[12], c.stzOffset, 16);
     vs.kind = (int32_t)shader;
-    MeshFSParams fs = {};
+    MeshFSParams &fs = mps.back().second;
     fs.p = d.fs;
     fs.fogOn = s.fogEnable && CGraphic::m_Config.fog ? 1 : 0;
     fs.fogR = ((s.fogColor >> 16) & 0xff) / 255.0f;
     fs.fogG = ((s.fogColor >> 8) & 0xff) / 255.0f;
     fs.fogB = (s.fogColor & 0xff) / 255.0f;
-    if (!g->meshParams.empty() && !memcmp(&g->meshParams.back().first, &vs, sizeof(vs)) &&
-        !memcmp(&g->meshParams.back().second, &fs, sizeof(fs))) {
-        d.meshParams = (uint32_t)g->meshParams.size() - 1;
+    size_t np = mps.size();
+    if (np >= 2 && SameBytes(mps[np - 2].first.v[4], vs.v[4], 64) && SameBytes(&mps[np - 2].first, &vs, sizeof(vs)) &&
+        SameBytes(&mps[np - 2].second, &fs, sizeof(fs))) {
+        mps.pop_back();
+        d.meshParams = (uint32_t)np - 2;
     } else {
-        d.meshParams = (uint32_t)g->meshParams.size();
-        g->meshParams.push_back({vs, fs});
+        d.meshParams = (uint32_t)np - 1;
         g_stats.meshParamBlocks++;
     }
     g_stats.meshDraws++;

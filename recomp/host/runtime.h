@@ -57,6 +57,12 @@ enum { H_NONE, H_FILE, H_EVENT, H_SEMAPHORE, H_THREAD, H_MAPPING, H_HEAP, H_FIND
 uint32_t rt_handle_new(int kind, void *obj);
 void *rt_handle_get(uint32_t h, int kind);
 uint64_t rt_thread_cpu_ns(uint32_t handle);   // guest thread CPU time (Linux), 0 if unknown
+// Fibers: guest threads that run on the host thread switching to them (host/tasks.cpp)
+RtThread *rt_fiber_create(void (*fn)(void *), void *arg);
+void rt_fiber_switch(RtThread *to);
+void rt_fiber_destroy(RtThread *t);
+RtThread *rt_thread_from_handle(uint32_t h);
+uint32_t rt_handle_of(RtThread *t);
 void rt_handle_close(uint32_t h);
 
 // Memory helpers

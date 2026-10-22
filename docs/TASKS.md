@@ -27,7 +27,13 @@ Contents: [scheduler](#the-scheduler-0x41ab00-0x41af70) Â· [tasks](#the-tasks) Â
 | `0x41af50` | find by id | |
 
 So one tick runs every ready task once, in priority order (low number first); a task that sleeps
-n ticks runs every n-th tick. Globals: list head `0x758208`, current task `0x758204`.
+n ticks runs every n-th tick.
+
+**In the port** the scheduler is native (`recomp/host/tasks.cpp`, since 2026-10-13): every task is
+a fiber on the message loop's thread instead of a Windows thread, and a hand-over is a register
+swap instead of SetEvent + WaitForSingleObject. The task list and structures stay in guest memory
+as above; the C runtime's per-thread data is still allocated, set up and freed as `_beginthread`
+/ `_threadstart` / `_endthread` did. Globals: list head `0x758208`, current task `0x758204`.
 
 **Task structure** (0x58 bytes, `0x41ad00`):
 

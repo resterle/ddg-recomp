@@ -13,7 +13,7 @@ import exepatch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.environ.get('PERFECT_EXE', os.path.join(HERE, 'perfect.exe'))   # the exe the game will run with
-OUT = os.path.join(HERE, 'build', 'game')
+OUT = os.environ.get('RECOMP_GAME_DIR', os.path.join(HERE, 'build', 'game'))   # builder: its work folder
 CHUNKS = 16
 
 
@@ -76,8 +76,9 @@ def main():
         extra |= {v for v in (int(x, 16) for x in open(disc).read().split() if x.strip()) if tlo <= v < thi}
     extra = {x for x in extra if not plan.native_name(x)}
     print('extra roots (raw pointers / discovered): %d' % len(extra))
-    # roots: CRT entry, plus what the native WinMain / message loop call into
-    T, N = plan.partition(F, [0x4a45af, 0x407170, 0x401430, 0x478ed0, 0x41af10, 0x409060], ptrs)
+    # roots: CRT entry, plus what the native WinMain / message loop / task scheduler call into
+    # (0x41c490 / 0x41c4b0: the allocator host/tasks.cpp uses for task structures)
+    T, N = plan.partition(F, [0x4a45af, 0x407170, 0x401430, 0x478ed0, 0x409060, 0x41c490, 0x41c4b0], ptrs)
     native = {f: 'N_%08x' % f for f in N}
     # functions in native ranges that are only reached through pointers (static initialisers,
     # callbacks): they need a native entry too
@@ -89,6 +90,8 @@ def main():
     entries = true_entries(F) | set(native) | extra
     lifter = Lifter(pe, entries, native)
     lifter.imm_overrides = dict(plan.IMM_OVERRIDES)
+    lifter.mem_overrides = dict(plan.MEM_OVERRIDES)
+    lifter.branch_overrides = dict(plan.BRANCH_OVERRIDES)
     lifter.native_pred = lambda a: plan.native_name(a) is not None
 
     os.makedirs(OUT, exist_ok=True)

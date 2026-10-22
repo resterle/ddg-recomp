@@ -167,6 +167,15 @@ uint32_t CTexture::GetPalette(int nHandle) const
                                                                                      : CGraphic::kNoPalette;
 }
 
+bool CTexture::IsLoaded(const TXMHEADER *p, bool bAllocOnly)
+{
+    if (p->state != kLoaded) return false;
+    uint8_t cs = p->clutState;
+    if (cs == kLoaded || cs == kNoClutMarked) return true;
+    if (cs == 0xff) return false;
+    return !(CGraphic::GetTextureFormat() == TEXFMT_P8 || bAllocOnly);      // as Load
+}
+
 bool CTexture::Load(TXMHEADER *p, bool bAllocOnly, int nVariant)
 {
     (void)nVariant;

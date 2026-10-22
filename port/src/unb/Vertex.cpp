@@ -63,6 +63,15 @@ void CVertex::Term()
         if (m.pHeader) memset(m.pHeader + 0x0c, 0, 4);
     }
     m_Models.clear();
+    m_Blocks.clear();
+}
+
+bool CVertex::InModelPackets(const uint8_t *p, size_t n) const
+{
+    auto it = m_Blocks.upper_bound(p);
+    if (it == m_Blocks.begin()) return false;
+    --it;
+    return p + n <= it->second;
 }
 
 uint8_t *CVertex::PacketBlock(uint8_t *pModel)
@@ -150,6 +159,7 @@ bool CVertex::RegisterModel(uint8_t *pModel, TXMHEADER *const *ppTexList, int nT
         }
         q = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(e3) + 15) & ~uintptr_t(15));
     }
+    m_Blocks[block] = end;
     return true;
 }
 
@@ -157,6 +167,7 @@ void CVertex::UnregisterModel(uint8_t *pModel)
 {
     uint8_t *block = PacketBlock(pModel);
     uint8_t *end = block + PacketBlockSize(pModel);
+    m_Blocks.erase(block);
     for (uint8_t *q = block + 0x10; q + 0x10 < end;) {
         uint32_t c1 = U32(q + 0x0c);
         if (!IsUnpack(c1)) return;

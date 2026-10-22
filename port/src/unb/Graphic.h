@@ -128,7 +128,19 @@ public:
     // GL renderer with a render thread: the previous frame is still being drawn (the frame
     // limiter then skips drawing instead of waiting). Not defined by the SDL GPU renderer.
     static bool FrameInFlight();
+    static bool Threaded();             // GL: drawing happens on a render thread (any thread may record)
     static uint64_t FrameBusyNs();      // estimated time until the frame in flight is presented
+    // GL: the last frame's time on its slowest stage after the game thread (list thread, render
+    // thread, GPU); 0 where not measured
+    static uint64_t FrameLoadNs();
+    // Port overlay (host/overlay.cpp, the options menu): an RGBA8 image, rows top-down, drawn
+    // opaque and centred over the picture at an integer scale; nullptr hides it. Copied; any
+    // thread.
+    static void SetOverlay(const uint8_t *pRGBA, int nWidth, int nHeight);
+    // graphics.ini "fps": the frames-per-second counter (GL renderer only; HasFpsCounter)
+    static bool HasFpsCounter();
+    static bool FpsCounter();
+    static void SetFpsCounter(bool bOn);
 
     // Textures and palettes
     static bool SetGamma(float fGamma, bool bStore);

@@ -19,6 +19,8 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 class IVu1Handler {
 public:
@@ -54,6 +56,17 @@ public:
     // passed through, the original read it from the input state).
     static void Send(int channel, const void *base, uint32_t tadr, uint32_t chcr = dma::CHCR_TTE,
                      bool bSnapshotKey = false);
+
+    // A source chain as a list of data segments in chain order (VIF1 only), so that it can be
+    // walked later while the game reuses its memory: data inside the chain (cnt, next, call...
+    // tags) is copied into `copy`, and so is data that ref/refs/refe tags point to, unless
+    // `inPlace` says it does not change meanwhile (registered model packets).
+    // SendSegments then does what Send(VIF1) does with the chain.
+    struct Segment { const uint8_t *data; size_t copyOff; uint32_t words; uint32_t vif[2]; };
+    static void Flatten(const void *base, uint32_t tadr, std::vector<Segment> &segs, std::vector<uint8_t> &copy,
+                        const std::function<bool(const uint8_t *, size_t)> &inPlace);
+    static void SendSegments(const std::vector<Segment> &segs, const std::vector<uint8_t> &copy, uint32_t chcr,
+                             bool bSnapshotKey);
 
     // Completion callback, as registered with sceDmaAddIntcHandler on the PS2 (0x40d180).
     static void SetHandler(int channel, Handler fn, bool enabled = true);

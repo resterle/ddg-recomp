@@ -6,6 +6,7 @@
 
 #include "runtime.h"
 #include "launcher.h"
+#include "overlay.h"
 #include "../../port/src/unb/Dma.h"
 #include "../../port/src/unb/Graphic.h"
 #include "../../port/src/unb/Gs.h"
@@ -25,8 +26,14 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <string>
-#include <string>
 #include <vector>
+#ifdef RECOMP_GL
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <pthread.h>
+#include <thread>
+#endif
 
 // getenv once per call site (debug hooks run in hot paths)
 #define CACHED_ENV(name) ([]() -> const char * { static const char *v_ = getenv(name); return v_; }())
@@ -34,6 +41,10 @@
 extern "C" {
 void rt_event_set(uint32_t h);
 int rt_init(const char *exe, const char *gameDir);
+extern "C" int rt_jit_cached(const char *exe);       // host/jit.cpp
+extern "C" void rt_jit_start(const char *exe);
+extern "C" int rt_jit_poll(const char *exe, char *text, size_t size);
+extern "C" int rt_jit_ensure(const char *exe);
 extern uint8_t g_asyncKeys[256];
 }
 
@@ -53,12 +64,91 @@ static uint64_t TickMs() { return g_tickCount * 1000 / 60; }
 #define NATIVE extern "C" void
 
 // ---------------------------------------------------------------------------------------------
+// Asynchronous frame chains (GL renderer with its render thread). The frame driver task sends the
+// frame built during the previous tick (sceDmaSend from the flip, 0x419270) and the other tasks
+// then build the next one into the other half of the game's double-buffered packet memory (PS2
+// heritage: DMA ran beside the CPU there). Walking the chain (VIF, VU1 packets, GS, recording
+// the draws) took about as long as the game logic on the R36H, one after the other on the game
+// thread; the DMA thread now walks it while the game computes the next tick. The game reuses the
+// chain's memory right after the send (black frames when it was walked in place), so the send
+// copies the chain first (CDma::Flatten). Data that ref tags point to inside registered model
+// packets (most of the chain's bytes) is read in place, as those change only with model
+// (un)registration; RECOMP_DMA_COPYREFS=1 copies them too. Everything from game
+// code that reaches the packet path's state (CGs, CVertex, CTexture, CGraphic) waits for the
+// chain first (DmaSync), so it happens in the original order: the next send, the GS draw
+// environment swap, texture and model (un)loading, viewport and gamma. RECOMP_ASYNC_DMA=0 turns
+// it off.
+#ifdef RECOMP_GL
+static bool g_asyncDma;
+static std::mutex g_dmaLock;
+static std::condition_variable g_dmaCv;
+static bool g_dmaPending;                           // a chain is queued or being walked
+static struct { uint32_t chcr; bool shot; } g_dmaJob;
+static std::vector<CDma::Segment> g_dmaSegs;       // the chain at the send (CDma::Flatten)
+static std::vector<uint8_t> g_dmaCopy;
+static uint64_t g_dmaWaitNs, g_dmaCopyNs;          // game thread: waiting for the DMA thread, copying chains (RECOMP_TRACE_TICKS)
+static std::atomic<uint64_t> g_dmaChainNs;         // DMA thread: time of the last chain (DrawLoadTick)
+
+static void DmaMain()
+{
+    for (;;) {
+        std::unique_lock<std::mutex> lk(g_dmaLock);
+        g_dmaCv.wait(lk, [] { return g_dmaPending; });
+        auto job = g_dmaJob;
+        lk.unlock();
+        uint64_t t0 = SDL_GetTicksNS();
+        CDma::SendSegments(g_dmaSegs, g_dmaCopy, job.chcr, job.shot);
+        g_dmaChainNs = SDL_GetTicksNS() - t0;
+        lk.lock();
+        g_dmaPending = false;
+        g_dmaCv.notify_all();
+    }
+}
+
+static void DmaSync()
+{
+    if (!g_asyncDma) return;
+    uint64_t t0 = SDL_GetTicksNS();
+    std::unique_lock<std::mutex> lk(g_dmaLock);
+    g_dmaCv.wait(lk, [] { return !g_dmaPending; });
+    g_dmaWaitNs += SDL_GetTicksNS() - t0;
+}
+
+static double DmaWaitMs()                           // per tick of the last 600, then reset
+{
+    double ms = g_dmaWaitNs / 600 / 1e6;
+    if (g_asyncDma) fprintf(stderr, "dma thread: game thread waited %.2f ms/tick, copied chains %.2f ms/tick\n", ms, g_dmaCopyNs / 600 / 1e6);
+    g_dmaWaitNs = g_dmaCopyNs = 0;
+    return ms;
+}
+
+static void DmaStart()
+{
+    const char *e = getenv("RECOMP_ASYNC_DMA");
+    g_asyncDma = CGraphic::Threaded() && !(e && atoi(e) == 0);
+    if (g_asyncDma) std::thread([] {
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), "dma");
+#elif defined(__APPLE__)
+        pthread_setname_np("dma");
+#endif
+        DmaMain();
+    }).detach();
+}
+#else
+static void DmaSync() {}
+static void DmaStart() {}
+static double DmaWaitMs() { return 0; }
+#endif
+
+// ---------------------------------------------------------------------------------------------
 // Graphics (CGraphic, Graphic.cpp)
 
 NATIVE N_00402a50(void) { RT_RETURN(0, 0); }                                     // CGraphic::Term (at exit)
-NATIVE N_00403560(void) { RT_RETURN(CGraphic::SetGamma(RDF32(R.esp + 4), ARG(1) != 0), 0); }
+NATIVE N_00403560(void) { DmaSync(); RT_RETURN(CGraphic::SetGamma(RDF32(R.esp + 4), ARG(1) != 0), 0); }
 NATIVE N_00404390(void)
 {
+    DmaSync();
     if (CACHED_ENV("RECOMP_TRACE_VIEWPORT")) fprintf(stderr, "SetViewport(%d, %d) from %08x\n", (int)ARG(0), (int)ARG(1), RD32(R.esp));
     RT_RETURN(CGraphic::SetViewport((int)ARG(0), ARG(1) != 0), 0);
 }
@@ -94,6 +184,8 @@ NATIVE N_004068d0(void) { RT_RETURN(0, 0); }                                    
 NATIVE N_0040a2e0(void) { RT_RETURN(R.ecx, 0); }                                 // destructor
 NATIVE N_0040a800(void)                                                          // Load(record, allocOnly, variant)
 {
+    // called every tick for the scenery's textures, nearly always loaded already
+    if (!CTexture::IsLoaded(reinterpret_cast<const TXMHEADER *>(MEM + ARG(0)), ARG(1) != 0)) DmaSync();
     bool ok = g_texture.Load(reinterpret_cast<TXMHEADER *>(MEM + ARG(0)), ARG(1) != 0, (int)ARG(2));
     if (CACHED_ENV("RECOMP_TRACE_TEX")) {
         uint32_t h = ARG(0);
@@ -103,11 +195,13 @@ NATIVE N_0040a800(void)                                                         
 }
 NATIVE N_0040a8a0(void)                                                          // Unload(record)
 {
+    DmaSync();
     if (ARG(0)) g_texture.Unload(reinterpret_cast<TXMHEADER *>(MEM + ARG(0)));
     RT_RETURN(0, 4);
 }
 NATIVE N_0040b140(void)                                                          // Update(record, pixels, x, y)
 {
+    DmaSync();
     bool ok = g_texture.Update(reinterpret_cast<TXMHEADER *>(MEM + ARG(0)), MEM + ARG(1), (int)ARG(2), (int)ARG(3));
     if (CACHED_ENV("RECOMP_TRACE_TEX")) {
         static int n; uint32_t h = ARG(0);
@@ -135,7 +229,8 @@ NATIVE N_00411540(void)                                                         
 {
     uint32_t obj = ARG(0), list = ARG(1);
     uint32_t flags = RD32(obj);
-    if (flags & 0x80000000u) RT_RETURN(1, 12);
+    if (flags & 0x80000000u) RT_RETURN(1, 12);     // registered already (every tick for the scenery)
+    DmaSync();
     // texture list: as many entries as the models' texture tables reference
     int need = 0;
     for (int i = 0; i < 3; i++) {
@@ -160,6 +255,7 @@ NATIVE N_00411540(void)                                                         
 // list holds 8-byte entries whose first word points at a TXM record.
 NATIVE N_00411600(void)
 {
+    DmaSync();
     uint32_t model = ARG(0), list = ARG(1);
     uint8_t *m = MEM + model;
     int need = 0;
@@ -175,12 +271,14 @@ NATIVE N_00411600(void)
 }
 NATIVE N_004117f0(void)                                                          // UnregisterModel(model, ?)
 {
+    DmaSync();
     if (ARG(0)) g_vertex.UnregisterModel(MEM + ARG(0));
     RT_RETURN(1, 8);
 }
 
 NATIVE N_004115b0(void)                                                          // UnregisterObject(object)
 {
+    DmaSync();
     uint32_t obj = ARG(0);
     if (obj && (RD32(obj) & 0x80000000u)) {
         WR32(obj, RD32(obj) & 0x7fffffffu);
@@ -254,6 +352,9 @@ static void Phase(int i, uint64_t t0)
 
 NATIVE N_004145b0(void)
 {
+    uint64_t w0 = SDL_GetTicksNS();
+    DmaSync();                                      // the previous chain first (and its counters)
+    g_renderNs += SDL_GetTicksNS() - w0;
     uint32_t ch = ARG(0), tadr = ARG(1);
     if ((ch - 0x676300u) / 0x90 == 1) g_framesThisTick++;
     // RECOMP_TRACE_STATS: DMA/GS counters every 120 frames
@@ -274,6 +375,20 @@ NATIVE N_004145b0(void)
     if (idx == 1 && g_shotPending && CACHED_ENV("RECOMP_SHOT_TRACE")) CGs::traceKicks = 2000;
     if (idx == 1) g_shotPending = false;
     uint64_t r0 = SDL_GetTicksNS(), i0 = rt_thread_instructions();
+#ifdef RECOMP_GL
+    if (idx == 1 && g_asyncDma) {
+        std::lock_guard<std::mutex> lk(g_dmaLock);
+        uint64_t c0 = SDL_GetTicksNS();
+        static const bool copyRefs = getenv("RECOMP_DMA_COPYREFS") && atoi(getenv("RECOMP_DMA_COPYREFS"));
+        CDma::Flatten(MEM, RD32(ch + 0x30), g_dmaSegs, g_dmaCopy, [](const uint8_t *p, size_t n) {
+            return !copyRefs && g_vertex.InModelPackets(p, n);
+        });
+        g_dmaCopyNs += SDL_GetTicksNS() - c0;
+        g_dmaJob = {RD32(ch), shot};
+        g_dmaPending = true;
+        g_dmaCv.notify_all();
+    } else
+#endif
     CDma::Send(idx, MEM, RD32(ch + 0x30), RD32(ch), shot);
     g_renderNs += SDL_GetTicksNS() - r0;
     g_renderInstr += rt_thread_instructions() - i0;
@@ -291,6 +406,7 @@ NATIVE N_004145b0(void)
 
 NATIVE N_00414c60(void)
 {
+    DmaSync();
     uint32_t dc = ARG(0), field = ARG(1);
     uint32_t disp = dc + field * 0x28;
     static const uint32_t kDisp[5] = {0x673250, 0x673258, 0x673270, 0x673278, 0x673298};
@@ -333,6 +449,62 @@ static int g_frameskipMax;
 static uint32_t g_drawInterval = 1;
 static uint32_t g_framesSkipped;
 static uint64_t g_tickLateNs, g_tickPeriodNs;  // how late the current tick started (message loop)
+
+// Automatic draw distance (drawdistance = auto): the game's controller 0x47e1d0 moves RendPow up
+// while its load is below the budget and down above it (plan.MEM_OVERRIDES). The load is the
+// busiest stage's share of a drawn frame's period, in the controller's units (kLoadFrame = one
+// period): the game thread's work over the ticks of a frame (it includes waiting for the DMA and
+// render threads when they fall behind), the DMA thread's last chain, and the renderer's slowest
+// stage (CGraphic::FrameLoadNs: list thread, render thread + waiting for the GPU).
+static constexpr int kLoadFrame = 525;
+static bool g_ddAuto;
+static uint32_t g_ddLoadSum, g_ddLoadMax, g_ddLoadTicks;     // RECOMP_TRACE_TICKS
+static double g_ddPowSum;
+
+static void DrawLoadTick(uint64_t busyNs, uint64_t periodNs)
+{
+    if (!g_ddAuto) return;
+    if (!periodNs) periodNs = 16666667;
+    static uint64_t ring[6];
+    static uint32_t n;
+    uint32_t k = SDL_min(g_drawInterval, 6u);
+    ring[n++ % 6] = busyNs;
+    uint64_t game = 0;
+    for (uint32_t i = 0; i < k; i++) game += ring[(n - 1 - i) % 6];
+    uint64_t frameNs = periodNs * k, stage = 0;
+#ifdef RECOMP_GL
+    stage = SDL_max((uint64_t)g_dmaChainNs, CGraphic::FrameLoadNs());
+#endif
+    uint64_t worst = SDL_max(game, stage);
+    uint32_t load = (uint32_t)SDL_min(worst * kLoadFrame / frameNs, (uint64_t)(8 * kLoadFrame));
+    // smoothed over ~16 ticks: single frames vary by a factor of two or more
+    static uint32_t smooth16;           // 16 x the smoothed load
+    smooth16 = smooth16 ? smooth16 - smooth16 / 16 + load : load * 16;
+    WR32(0x7ffc0018, smooth16 / 16);    // plan.SETTING_DD_LOAD
+    g_ddLoadSum += load;
+    g_ddLoadMax = SDL_max(g_ddLoadMax, load);
+    g_ddLoadTicks++;
+    float pow;
+    uint32_t u = RD32(0x5db0f8);
+    memcpy(&pow, &u, 4);
+    g_ddPowSum += pow;
+    // RECOMP_TRACE_DD: every tick, the load and its parts (game, DMA thread, renderer) with the
+    // draw distance and the train's speed (0x74f604), which sets the controller's fine steps
+    if (CACHED_ENV("RECOMP_TRACE_DD")) {
+        float speed;
+        u = RD32(0x74f604);
+        memcpy(&speed, &u, 4);
+#ifdef RECOMP_GL
+        uint64_t dma = g_dmaChainNs, gfx = CGraphic::FrameLoadNs();
+#else
+        uint64_t dma = 0, gfx = 0;
+#endif
+        fprintf(stderr, "dd t=%.2f load %u smoothed %u (game %.1f dma %.1f gfx %.1f ms) pow %.3f speed %.2f\n", TickMs() / 1000.0, load, smooth16 / 16,
+                game / 1e6, dma / 1e6, gfx / 1e6, pow, speed);
+    }
+}
+extern "C" void N_0041af10(void);            // host/tasks.cpp
+
 // RECOMP_SKIP=<addr>@<s>[,...]: functions translated with LIFT_SKIPPABLE return at once from tick
 // time s on (reverse engineering: what does this function do?).
 extern "C" int rt_skip(uint32_t addr)
@@ -439,8 +611,9 @@ static uint8_t VirtualKey(SDL_Scancode s)
 
 // Gamepads act as keyboards (the game's keyboard layout, see docs/DEVELOPMENT.md): d-pad/left stick =
 // arrows, A/Start = Return, B/Back = Escape, X = Space, shoulders = PageUp/PageDown,
-// triggers = Home/End. Start+Back quits (handhelds have no keyboard), R3 takes a screenshot.
-static void GamepadKeys(uint8_t *keys)
+// triggers = Home/End. Start+Back quits (handhelds have no keyboard), R3 takes a screenshot, Y
+// (unused by the game's layout) opens the options menu (*menu, host/overlay.cpp).
+static void GamepadKeys(uint8_t *keys, bool *menu)
 {
     int count = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&count);
@@ -463,6 +636,7 @@ static void GamepadKeys(uint8_t *keys)
             {axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000, 0x23},
         };
         for (auto &m : map) if (m.on) keys[m.vk] = 0x80;
+        if (btn(SDL_GAMEPAD_BUTTON_NORTH)) *menu = true;
         // right stick click: one screenshot (snapshot/*.bmp next to the program), like F12
         static bool r3Prev;
         bool r3 = btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK);
@@ -501,6 +675,7 @@ NATIVE N_004074a0(void)
 {
     uint8_t keys[256];
     for (;;) {
+        bool menuButton = false;                        // gamepad Y (GamepadKeys) or F10
         rt_leave();
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -526,7 +701,7 @@ NATIVE N_004074a0(void)
         const bool *state = SDL_GetKeyboardState(&n);
         for (int s = 0; s < n; s++)
             if (state[s]) if (uint8_t vk = VirtualKey((SDL_Scancode)s)) keys[vk] = 0x80;
-        GamepadKeys(keys);
+        GamepadKeys(keys, &menuButton);
         g_snapshotKey = state[SDL_SCANCODE_F12];
         // test hook: RECOMP_EXIT_AFTER=<seconds> (tick time) quits; PGO builds write their
         // profile first (an alarm signal would kill the process before it does)
@@ -616,6 +791,11 @@ NATIVE N_004074a0(void)
                         RD32(0x670a60), pad, pad ? RD32(pad + 0x28) : 0, pad ? RD32(pad + 0x80) : 0, keys[0x0d], RD32(0x72bb60), RD32(0x758274), RD32(RD32(0x758274) + 0x20), RD32(RD32(0x758274) + 0x28));
             }
         }
+        // F10 (also from RECOMP_KEYS: vk 79) opens the options menu instead of reaching the game;
+        // while the menu is open the game gets no input (host/overlay.cpp)
+        menuButton |= keys[0x79] != 0;
+        keys[0x79] = 0;
+        OverlayUpdate(keys, menuButton);
         memcpy(MEM + 0x6708e0, keys, 256);
         memcpy(g_asyncKeys, keys, 256);
         // One call is one PS2 vsync: it wakes the game's tasks for a tick. The original was paced
@@ -672,10 +852,16 @@ NATIVE N_004074a0(void)
             }
 #endif
             if (g_frameskipMax) { fprintf(stderr, "frameskip: %u of 600 frames skipped\n", g_framesSkipped); g_framesSkipped = 0; }
-            fprintf(stderr, "t=%.0fs ticks %.1f/s clock %u | game %.2f render %.2f ms/tick | process cpu %.2f ms/tick %.2f Minstr/tick | game %.2f render %.2f Minstr/tick | loop ms avg/max: present %.2f/%.1f gil %.2f/%.1f delay %.2f/%.1f | presents %u, late %u, worst gap %.0f ms | mesh draws/frame %.0f, param blocks %.0f, all draws %.0f, pipeline binds %.0f | work/tick avg %.2f max %.2f ms | flushes/tick %.1f, "
+            if (g_ddAuto && g_ddLoadTicks) {
+                fprintf(stderr, "draw distance: %.3f (average), load %.0f%% average, %.0f%% max of the frame period\n",
+                        g_ddPowSum / g_ddLoadTicks, 100.0 * g_ddLoadSum / g_ddLoadTicks / kLoadFrame, 100.0 * g_ddLoadMax / kLoadFrame);
+                g_ddLoadSum = g_ddLoadMax = g_ddLoadTicks = 0;
+                g_ddPowSum = 0;
+            }
+            fprintf(stderr, "t=%.0fs ticks %.1f/s clock %u | game %.2f render %.2f ms/tick (dma wait %.2f) | process cpu %.2f ms/tick %.2f Minstr/tick | game %.2f render %.2f Minstr/tick | loop ms avg/max: present %.2f/%.1f gil %.2f/%.1f delay %.2f/%.1f | presents %u, late %u, worst gap %.0f ms | mesh draws/frame %.0f, param blocks %.0f, all draws %.0f, pipeline binds %.0f | work/tick avg %.2f max %.2f ms | flushes/tick %.1f, "
                     "upload %.0f KB/s (tex %u = %.0f KB/s, mesh %.0f, vertices %.0f) | textures %u (+%u -%u), meshes %u (+%u -%u), pipelines %u | heap %08x (live %.1f MB) virt %08x | rss %llu MB (guest %llu MB)\n",
                     TickMs() / 1000.0, 600e9 / (double)(now - since), RD32(0x717fc4),
-                    (g_tickBusyNs - g_renderNs) / 600 / 1e6, g_renderNs / 600 / 1e6, ProcessCpuMsPerTick(), ProcessMInstrPerTick(), GameMInstrPerTick() - g_renderInstr / 600 / 1e6, g_renderInstr / 600 / 1e6,
+                    (g_tickBusyNs - g_renderNs) / 600 / 1e6, g_renderNs / 600 / 1e6, DmaWaitMs(), ProcessCpuMsPerTick(), ProcessMInstrPerTick(), GameMInstrPerTick() - g_renderInstr / 600 / 1e6, g_renderInstr / 600 / 1e6,
                     g_phaseNs[0] / 600 / 1e6, g_phaseMaxNs[0] / 1e6, g_phaseNs[1] / 600 / 1e6, g_phaseMaxNs[1] / 1e6,
                     g_phaseNs[2] / 600 / 1e6, g_phaseMaxNs[2] / 1e6, g_presents, g_presentsLate,
                     g_presentGapMaxNs / 1e6, gs.meshDraws / 600.0, gs.meshParamBlocks / 600.0, gs.drawCmds / 600.0,
@@ -743,9 +929,12 @@ NATIVE N_004074a0(void)
         uint64_t res0 = 0;
 #endif
         uint64_t read0 = g_readNs, readB0 = g_readBytes, render0 = g_renderNs;
-        rt_call(0x41af10, 0, nullptr);
+        R.esp -= 4;                                 // vsync tick: the task scheduler (host/tasks.cpp)
+        WR32(R.esp, 0);
+        N_0041af10();
         {
             uint64_t busy = SDL_GetTicksNS() - tickStart;
+            DrawLoadTick(busy, g_tickPeriodNs);
             g_tickBusyNs += busy;
             if (busy > g_tickBusyMaxNs) g_tickBusyMaxNs = busy;
             // RECOMP_TRACE_SPIKES=<ms>: break down every tick that takes longer
@@ -802,18 +991,30 @@ NATIVE N_004074a0(void)
 //   aspect       = auto | <x>     3D projection X aspect; auto = (4/3 * scrheight) / scrwidth,
 //                                 1.0 is the original 4:3 (UI is stretched, not re-laid out)
 //   aspecty      = <y>            3D projection Y aspect (original 0.5)
-//   drawdistance = <RendPow>      render distance factor (original 0.9, DDGModernizer default 0.6)
-//   okidist      = <OkiDistArg>   distance of placed objects (original 0.4)
+//   drawdistance = auto | original | <n>
+//                                 auto: the game's own controller (0x47e1d0) steering the draw
+//                                 distance by the load measured here (DrawLoadTick); original:
+//                                 the same controller fed with the original timing (always 0.45
+//                                 on a PC); <n>: fixed RendPow (DDGModernizer's patch; 0.9 is the
+//                                 exe's default value)
+//   ddmin, ddmax = <n>            auto: range of the draw distance (0.45, 1.0; the PSP version
+//                                 used 0.625-1.0 on a 30 frames/s budget)
+//   ddload       = <fraction>     auto: share of the frame period the busiest stage is steered
+//                                 to (0.80)
+//   okidist      = <OkiDistArg>   distance of placed objects with a fixed draw distance (0.4)
 //   frameskip    = <n>            skip up to n frames in a row when behind (0 = draw every frame)
 //   maxfps       = <n>            draw at most n frames per second (60/n ticks apart; 0 = 60)
-// DDGModernizer's patches themselves are applied when the exe is loaded (recomp/exepatch.py,
-// host/runtime.c read_exe) with neutral values; these settings then replace those values.
+// DDGModernizer's aspect patches are applied when the exe is loaded (recomp/exepatch.py, host/
+// runtime.c read_exe) with neutral values that these settings replace; its draw distance patches
+// are a run-time switch (plan.SETTING_DD_FIXED, MEM_OVERRIDES / BRANCH_OVERRIDES).
 
 struct GameSettings {
     bool fullscreen = false;
     float aspectX = 0;          // 0 = auto
     float aspectY = 0.5f;
-    float rendPow = 0.6f;
+    float rendPow = 0;          // 0 = auto
+    bool ddOriginal = false;    // drawdistance = original
+    float ddMin = 0.45f, ddMax = 1.0f, ddLoad = 0.80f;
     float okiDist = 0.4f;
     int frameskip = 0;
     int maxfps = 0;
@@ -835,7 +1036,13 @@ static GameSettings LoadGameSettings()
         if (!SDL_strcasecmp(key, "fullscreen")) gs.fullscreen = atoi(val) != 0;
         else if (!SDL_strcasecmp(key, "aspect")) gs.aspectX = SDL_strcasecmp(val, "auto") ? v : 0;
         else if (!SDL_strcasecmp(key, "aspecty") && v > 0) gs.aspectY = v;
-        else if (!SDL_strcasecmp(key, "drawdistance") && v > 0) gs.rendPow = v;
+        else if (!SDL_strcasecmp(key, "drawdistance")) {
+            gs.ddOriginal = !SDL_strcasecmp(val, "original");
+            gs.rendPow = SDL_strcasecmp(val, "auto") && v > 0 ? v : 0;
+        }
+        else if (!SDL_strcasecmp(key, "ddmin") && v > 0) gs.ddMin = v;
+        else if (!SDL_strcasecmp(key, "ddmax") && v > 0) gs.ddMax = v;
+        else if (!SDL_strcasecmp(key, "ddload") && v > 0) gs.ddLoad = SDL_clamp(v, 0.2f, 1.5f);
         else if (!SDL_strcasecmp(key, "okidist") && v > 0) gs.okiDist = v;
         else if (!SDL_strcasecmp(key, "frameskip")) gs.frameskip = SDL_clamp(atoi(val), 0, 10);
         else if (!SDL_strcasecmp(key, "maxfps")) gs.maxfps = SDL_max(atoi(val), 0);
@@ -846,19 +1053,59 @@ static GameSettings LoadGameSettings()
 
 static void WRF(uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); WR32(a, u); }
 
+static float g_okiDist = 0.4f, g_ddMin = 0.45f;
+
+// Draw distance: rendPow > 0 fixed (DDGModernizer's patches, as a switch), 0 auto (the game's
+// controller fed with the measured load, plan.SETTING_DD_*), < 0 original (the controller with
+// the original timing). At startup and from the options menu.
+static void SetDrawDistance(float rendPow, float ddMax)
+{
+    if (rendPow > 0) {
+        WR32(0x7ffc0008, 1);            // plan.SETTING_DD_FIXED
+        WRF(0x7ffc000c, g_okiDist);     // plan.SETTING_OKIDIST
+        WRF(0x5db0f8, rendPow);         // RendPow
+        WRF(0x4c6ed4, rendPow);         // second copy DDGModernizer also sets
+        WRF(0x5db0f4, g_okiDist);       // OkiDistArg
+    } else {
+        WR32(0x7ffc0008, 0);            // the game recomputes RendPow every tick
+    }
+    // the load feeds the controller also with a fixed draw distance (its result then goes to a
+    // scratch slot), so that switching to auto continues from an adapted value
+    bool feed = rendPow >= 0;
+    if (feed && !RD32(0x7ffc0014)) WR32(0x730c60, 0);  // original's hold (plan.BRANCH_OVERRIDES)
+    g_ddAuto = feed;
+    WR32(0x7ffc0014, feed);             // plan.SETTING_DD_AUTO
+    WRF(0x7ffc0024, SDL_max(ddMax, g_ddMin));          // plan.SETTING_DD_MAX
+}
+
+static void SetMaxFps(int maxfps)
+{
+    g_drawInterval = maxfps > 0 && maxfps < 60 ? (uint32_t)SDL_clamp((60 + maxfps / 2) / maxfps, 1, 6) : 1;
+}
+
 static void ApplyGameSettings(const GameSettings &gs)
 {
     const GRAPHIC_CONFIG &c = CGraphic::m_Config;
     float ax = gs.aspectX > 0 ? gs.aspectX : (4.0f * c.scrheight / 3.0f) / (float)c.scrwidth;
     WRF(0x7ffc0000, ax);                // plan.SETTING_ASPECT_X (read by the patched aspect sites)
     WRF(0x7ffc0004, gs.aspectY);        // plan.SETTING_ASPECT_Y
-    WRF(0x5db0f8, gs.rendPow);          // RendPow
-    WRF(0x4c6ed4, gs.rendPow);          // second copy DDGModernizer also sets
-    WRF(0x5db0f4, gs.okiDist);          // OkiDistArg
+    g_okiDist = gs.okiDist;
+    g_ddMin = gs.ddMin;
+    WR32(0x7ffc0018, 0);                // plan.SETTING_DD_LOAD
+    WR32(0x7ffc001c, (uint32_t)lroundf(gs.ddLoad * kLoadFrame));   // plan.SETTING_DD_BUDGET
+    WRF(0x7ffc0020, gs.ddMin);          // plan.SETTING_DD_MIN
+    WRF(0x7ffc0028, 0.006f);            // plan.SETTING_DD_DOWN: 0.36 per second at most
+    WRF(0x7ffc002c, 0.002f);            // plan.SETTING_DD_UP: 0.12 per second at most
+    WRF(0x7ffc0030, 0.0008f);           // plan.SETTING_DD_UP2
+    SetDrawDistance(gs.ddOriginal ? -1 : gs.rendPow, gs.ddMax);
     g_frameskipMax = gs.frameskip;
-    g_drawInterval = gs.maxfps > 0 && gs.maxfps < 60 ? (uint32_t)SDL_clamp((60 + gs.maxfps / 2) / gs.maxfps, 1, 6) : 1;
-    fprintf(stderr, "settings: %dx%d, aspect %.4f/%.2f, draw distance %.2f, okidist %.2f, frameskip %d, %d frames/s at most%s\n",
-            c.scrwidth, c.scrheight, ax, gs.aspectY, gs.rendPow, gs.okiDist, gs.frameskip, 60 / (int)g_drawInterval,
+    SetMaxFps(gs.maxfps);
+    char dd[40];
+    if (gs.rendPow > 0) snprintf(dd, sizeof(dd), "%.2f, okidist %.2f", gs.rendPow, gs.okiDist);
+    else if (!gs.ddOriginal) snprintf(dd, sizeof(dd), "auto %.2f-%.2f at %.0f%% load", gs.ddMin, SDL_max(gs.ddMax, gs.ddMin), gs.ddLoad * 100);
+    else snprintf(dd, sizeof(dd), "original");
+    fprintf(stderr, "settings: %dx%d, aspect %.4f/%.2f, draw distance %s, frameskip %d, %d frames/s at most%s\n",
+            c.scrwidth, c.scrheight, ax, gs.aspectY, dd, gs.frameskip, 60 / (int)g_drawInterval,
             gs.fullscreen ? ", fullscreen" : "");
 }
 
@@ -876,6 +1123,23 @@ NATIVE N_00407260(void)
     }
     CGraphic::SetDeferredPresent(true);
     {
+        OverlayHost oh;
+        oh.current.scrWidth = CGraphic::m_Config.scrwidth;
+        oh.current.scrHeight = CGraphic::m_Config.scrheight;
+        oh.current.drawDistance = settings.ddOriginal ? -1 : settings.rendPow;
+        oh.current.ddMax = settings.ddMax;
+        oh.current.maxfps = settings.maxfps;
+        oh.current.fpsCounter = CGraphic::FpsCounter();
+        oh.iniPath = PrefDir() + "/graphics.ini";
+        oh.apply = [](const OverlayOptions &o) {
+            SetDrawDistance(o.drawDistance, o.ddMax);
+            SetMaxFps(o.maxfps);
+            CGraphic::SetFpsCounter(o.fpsCounter);
+        };
+        oh.drawDistanceNow = [] { float v; uint32_t u = RD32(0x5db0f8); memcpy(&v, &u, 4); return v; };
+        OverlayInit(oh);
+    }
+    {
         uint32_t hwnd = RD32(0x4c8bdc);
         if (!rt_call(0x409060, 1, &hwnd)) fprintf(stderr, "sound init failed\n");     // CSound init (translated)
     }
@@ -883,6 +1147,7 @@ NATIVE N_00407260(void)
     g_texture.Init();
     g_vertex.Init();
     CDma::SetVu1Handler(&g_vertex);
+    DmaStart();
     rt_call(0x401430, 0, nullptr);                  // file I/O thread
     uint32_t args[2] = {0, 0};
     rt_call(0x478ed0, 2, args);                     // PS2 main(0, 0)
@@ -1002,7 +1267,29 @@ static std::string CheckGameDir(const std::string &dir, const std::string &exe)
     }
 }
 
-static std::string CheckGameDirForLauncher(const std::string &dir) { return CheckGameDir(dir, ExePath(dir)); }
+// the exe the settings select: exePath, or the folder's
+static std::string ExeFor(const std::string &dir, const std::string &exePath)
+{
+    return exePath.empty() ? ExePath(dir) : exePath;
+}
+
+static std::string CheckGameDirForLauncher(const std::string &dir, const std::string &exePath)
+{
+    return CheckGameDir(dir, ExeFor(dir, exePath));
+}
+
+#ifdef RECOMP_JIT
+// the settings window prepares the game code for the chosen exe (host/jit.cpp)
+static const LauncherPrepare kPrepare = {
+    [](const std::string &dir, const std::string &exePath) { rt_jit_start(ExeFor(dir, exePath).c_str()); },
+    [](const std::string &dir, const std::string &exePath, std::string &text) {
+        char buf[256];
+        int state = rt_jit_poll(ExeFor(dir, exePath).c_str(), buf, sizeof buf);
+        text = buf;
+        return state;
+    },
+};
+#endif
 
 int main(int argc, char **argv)
 {
@@ -1031,22 +1318,38 @@ int main(int argc, char **argv)
     // when the game folder is unusable.
     std::string pref = PrefDir();
     LauncherSettings ls = LoadLauncherSettings(pref, dir);
-    std::string problem = CheckGameDir(dir, exe.empty() ? ExePath(dir) : exe);
+    ls.hasFpsCounter = CGraphic::HasFpsCounter();
+    if (!exe.empty()) ls.exePath = exe;              // given on the command line
+    std::string problem = CheckGameDir(dir, ExeFor(dir, ls.exePath));
     SDL_PumpEvents();
     bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
-    if (!play && (settingsFlag || ls.showLauncher || shift || !problem.empty())) {
-        if (!RunLauncher(ls, CheckGameDirForLauncher)) return 0;
+    bool show = settingsFlag || ls.showLauncher || shift || !problem.empty();
+    const LauncherPrepare *prep = nullptr;
+#ifdef RECOMP_JIT
+    // the settings window is also where the game code is prepared, the first time for an exe
+    if (problem.empty() && !rt_jit_cached(ExeFor(dir, ls.exePath).c_str())) show = true;
+    prep = &kPrepare;
+#endif
+    if (!play && show) {
+        if (!RunLauncher(ls, CheckGameDirForLauncher, prep)) return 0;
         SaveLauncherSettings(pref, ls);
-        if (ls.gameDir != dir) { dir = ls.gameDir; exe.clear(); }
+        dir = ls.gameDir;
         SaveGameDir(dir);
-        problem = CheckGameDir(dir, exe.empty() ? ExePath(dir) : exe);
+        problem = CheckGameDir(dir, ExeFor(dir, ls.exePath));
     }
     if (!problem.empty()) {
         fprintf(stderr, "game folder: %s\n(run with --settings to choose one)\n", problem.c_str());
         return 1;
     }
-    if (exe.empty()) exe = ExePath(dir);
+    exe = ExeFor(dir, ls.exePath);
     fprintf(stderr, "game folder: %s\n", dir.c_str());
+#ifdef RECOMP_JIT
+    // the game code (prepared in the settings window, or now); then the full check of the exe
+    // against the tables it brought
+    if (!rt_jit_ensure(exe.c_str())) return 1;
+    problem = CheckGameDir(dir, exe);
+    if (!problem.empty()) { fprintf(stderr, "game folder: %s\n", problem.c_str()); return 1; }
+#endif
 
     SDL_WindowFlags wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef RECOMP_GL

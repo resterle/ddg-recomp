@@ -71,6 +71,7 @@ public:
     // equivalent converters in the original (0x40b5a0 / 0x40bc10; CVertex passes 1); the port
     // has one decoder and ignores it.
     bool Load(TXMHEADER *p, bool bAllocOnly = false, int nVariant = 0);
+    static bool IsLoaded(const TXMHEADER *p, bool bAllocOnly);   // Load(p, bAllocOnly) would change nothing
     void Unload(TXMHEADER *p);                              // 0x40a8a0
     // 0x40b140: upload new pixels for a loaded record at (x, y), in record size.
     bool Update(const TXMHEADER *p, const void *pPixels, int x = 0, int y = 0);

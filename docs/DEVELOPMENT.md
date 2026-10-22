@@ -81,6 +81,7 @@ player's aspect and draw distance then replace the neutral values (below).
 | `recomp/recomp_rt.h` | Runtime header for generated code (CPU struct, memory macros, x87 helpers) |
 | `recomp/exepatch.py` | Reads `perfect.exe`: SafeDisc check, DDGModernizer's patches with neutral values, image hash (section 1, "The exe") |
 | `docker-build.sh`, `recomp/linux/desktop/Dockerfile` | Generate and build with Docker only (desktop image: Ubuntu 22.04, SDL3, capstone; handheld: `linux/build-cross.sh`) |
+| `recomp/builder/` | The builder kit (§3k): `builder.py` (runs on the user's machine), `make-kit.py` (makes the kit), `README.txt` (the kit's) |
 | `recomp/plan.py` | Which address ranges/functions are native instead of translated |
 | `recomp/build_game.py` | Discovers functions, translates, writes `build/game/*.c` |
 | `recomp/verify.py`, `gen.py`, `rt_test.c` | Differential tester (Unicorn vs translated C) |
@@ -542,6 +543,296 @@ Benchmark runs on the device drive scripted input; a person using the device at 
   Installed in /roms/ports/densha and /roms2/ports/densha (`perfect_recomp.prev4-20261012` is
   the previous binary). Device bench folder: /roms2/dbench (`dbench.sh`, save, graphics.ini).
 
+### 3f. Game tasks as fibers (2026-10-13)
+
+The game's ~13 cooperative tasks (docs/TASKS.md) each had a guest thread; every tick about 14
+hand-overs went through SetEvent + WaitForSingleObject, i.e. a futex wake-up and sleep across two
+host threads. Profile on the PC (Osaka Loop, 60 frames/s): 27% of the guest threads' CPU time in
+system calls, ~57 us per hand-over. The scheduler (0x41ab00-0x41af70) is now native
+(`host/tasks.cpp`, `plan.NATIVE` "Tasks") and every task is a fiber (`rt_fiber_create`,
+`rt_fiber_switch` in `host/runtime.c`: guest CPU state and TIB swapped like a lock hand-over, host
+registers and stack swapped by `rt_ctx_switch`, assembly for x86-64 and arm64, ~16 ns on the PC;
+checked on arm64 under qemu). Each function follows the disassembly; the C runtime's per-thread
+data is allocated, entered and freed as `_beginthread`/`_threadstart`/`_endthread` did. Guest
+stacks of ended fibers are cleared and reused (new threads take a fresh 1 MB each, so ~250 mode
+changes would have exhausted the stack region). `0x41c490`/`0x41c4b0` (allocator used by the
+scheduler) are translation roots now.
+
+PC, Osaka Loop drive: game thread 2.25 -> 1.5 ms per tick (first part), 1.6 -> 0.97 ms (second
+part); process CPU -10..15%; idle tasks 0.001 instead of 0.02 ms per tick. Compared with the
+threaded build with maxfps 0 / frameskip 0 (deterministic frames), the drive is pixel-identical
+(100 and 140 s); only the menu's background slideshow can be at another picture (load timing).
+(An earlier comparison with maxfps 30 and frame skipping showed differences in rain and in the
+distance after the ATS stop: frames one tick apart, not a change.) A 6-minute run with game over,
+Continue and a restart: no errors, heap flat. R36H: game thread -1.2 ms per tick (-16%).
+
+### 3g. Draw distance: the game's own, or fixed (2026-10-13)
+
+The original sets the draw distance itself: every tick the 3D scene (`0x47d940`) calls
+`0x47e4f0`, which stores the result of `0x47e1d0` (it reads the train's speed, but gave 0.45 at
+every speed measured on the Osaka Loop: 0, 24 and 70 km/h) into RendPow `0x5db0f8`, resets OkiDistArg to 0.4 and
+scales further distances by it. DDGModernizer's [DrawDistance] patches remove that ("Fix
+magnification", "Fix for outer view"), so its fixed value applies.
+
+Since `exepatch.py` applied all of DDGModernizer's patches (2026-10-12), `drawdistance = 0.90`
+really meant 0.90, twice the game's own distance: on the R36H 2201 instead of 1091 mesh draws per
+frame, and the game fell to 43-53 ticks/s. Builds before that (from exes without DDGModernizer's
+patches, like the R36H's) ignored the setting. Now the canonical exe keeps the original
+[DrawDistance] code, and a fixed draw distance is a run-time switch (`plan.SETTING_DD_FIXED`):
+`MEM_OVERRIDES` sends the computed value to a scratch slot (0x47e504), `IMM_OVERRIDES` pushes the
+player's okidist instead of 0.4 (0x47e50a), `BRANCH_OVERRIDES` takes the cab-view rule in every
+view (0x423621). `drawdistance = auto` (default, also in the settings window) keeps the original
+behaviour. PC, Osaka Loop: auto 480-610 mesh draws per frame, 0.90 1030-1230.
+
+### 3h. Where the R36H's GPU time goes (2026-10-13)
+
+Osaka Loop drive in Driver Mode, draw distance auto, 60 frames/s, GPU load from devfreq (performance
+governor), leaving out one class of draws with `RECOMP_GL_EXP` (the parts overlap, so they do not
+add up): reference 74%; without 2D draws 41% (-33), of which the ~13 full-screen clear quads per
+frame (10 depth-only, 2-3 black; 12 screens of area) -6 and the HUD -28; without alpha-tested
+meshes 52% (-22: only ~25 draws, but they are the sky dome and the overhead wires, and discard
+keeps the Mali from killing sky pixels that are covered later); without blended meshes -9;
+without opaque meshes -10 (~1100 draws); final pass -8 before the gamma table, ~-5 with it;
+trivial fragment shader -23; everything scissored to one pixel 18% left (vertex and tiling work).
+
+2D per frame (PC census): 87 textured blended HUD draws covering ~3 screens, 3-4 untextured
+blended ones ~0.9 screens, the clear quads 12 screens; no palette-path draws. A textured full-
+screen pass costs the G31 ~5-7 points at 60 frames/s, so the HUD's cost is its area. Issuing the
+clear quads as glClear was tried and is slower (+2.5 points; mid-frame clears are not cheaper on
+this driver). Drawing alpha-tested meshes after the opaque ones in sorted runs: no gain (and no
+change of the picture; the old order already matches the unsorted game order).
+
+**HUD quads cropped** (`CropQuad`, `RECOMP_GL_CROPQUADS=0` to disable): 61% of the HUD's texels
+are fully transparent and 32% of its area lies outside the box of the visible texels. Textured
+2D quads whose transparent texels cannot change a pixel (source weighted by alpha, alpha from the
+texture: SELECTARG1 / MODULATE / MODULATE2X; axis-aligned, u along x and v along y, no repeat,
+constant colour and depth) are cropped to that box plus one texel (bilinear), texture coordinates
+mapped as before; boxes cached per texture region and texture version (`contentGen`). Frames
+identical (PC, maxfps 0: 0-31 pixels > 8; R36H 24). R36H GPU load 80.4% -> 74.4%.
+
+**Alpha-tested meshes (sky, wires, gantries):** ~22 alpha-tested draws per frame, all with binary
+alpha (0 or 255) and ALPHAREF 0.624, depth write on, mostly unblended; 33-81% transparent texels;
+textures 32x32 to 512x512, no mipmaps (only fully opaque textures get them). Tried on the R36H:
+plain box mipmaps for them -5 points, but distant overhead-line gantries vanish (the gain is the
+pixels they no longer cover); coverage-preserving mipmaps (alpha scaled per level so the share of
+texels passing the test stays that of level 0) keep them (dotted at a distance) and gain nothing
+(74.5% vs 76.0%). So their cost is the covered pixels and the discard, not texture fetches;
+neither was kept.
+
+### 3i. Longer draw distance on the R36H: CPU work per frame (2026-10-13)
+
+Goal: the overhead-line gantries far ahead are missing at the game's own draw distance (`auto`,
+0.45). R36H, Osaka Loop drive in Driver Mode, frames per second at 80-100 s (previous build):
+
+| drawdistance | far gantries | frames/s |
+|---|---|---|
+| auto (0.45) | partly missing | 60 |
+| 0.60 | the bridge and most gantries | 58-60 |
+| 0.75 | nearly all | 50-58 |
+| 1.00 | all | 38-48 |
+
+At 1.00 per frame: game thread ~9 ms game logic + ~10 ms walking the DMA chain (VIF, VU1 packets,
+GS, recording); render thread ~19 ms (draw list 8, uploads 2, submit 9). Both over 16.7 ms.
+
+- **Present clamp:** with `crop`, bilinear filtering at the outermost window pixels mixed in a
+  little of the overscan margin (3-6% of their colour); the final pass now clamps its texture
+  coordinates half a texel inside the shown canvas (GL `uClamp`, SDL GPU `PresentParams`). The
+  black top row in menus is the game's own picture (its menu art starts one row below the canvas).
+- **Profiler:** samples carry up to 4 return addresses from the frame-pointer chain (arm64),
+  `PROFILE_LINES=1` counts per source line. ITIMER_PROF is process-directed: its signals also
+  land on threads that are asleep (nanosleep between ticks, futex waits), which showed up as ~10%
+  "libc" on the game thread; those samples are someone else's CPU time.
+- **Submit:** ~20 us per draw call in the Mali driver regardless of size (one triangle per batch:
+  9.1 -> 8.5 ms; no mesh draw calls: 3.8 ms). Most batches are split by texture changes. Texture
+  arrays (`texarrays = 1`) re-measured: draw calls 346 -> 195, submit 8.7 -> 4.9 ms, but the GPU
+  becomes the limit (40 frames/s), as before.
+- **List thread** (`ListMain`, `RECOMP_GL_LISTTHREAD=0` to disable; not with texture arrays):
+  the draw list of a job (`BuildList`, buffers per job in `Job::List`) is built on its own thread
+  while the render thread submits the previous job; the render thread takes a job once its list is
+  built. Render thread at 1.00: ~19 -> ~12 ms per frame.
+- **DMA thread** (native.cpp, `RECOMP_ASYNC_DMA=0` to disable; GL with its render thread): the
+  frame driver sends the frame built during the previous tick and the tasks then build the next
+  one into the other half of the double-buffered packet memory, so the chain is walked on its own
+  thread while the game computes the next tick. Walked in place, frames were black: the game
+  reuses the chain's own memory right away. The send now copies the chain (`CDma::Flatten`): data
+  inside the chain (cnt/next/call tags) is copied, and so is data that ref tags point to, unless it
+  lies inside a registered model's packet block (`CVertex::InModelPackets`; those change only with
+  model (un)registration): 1.4 ms per tick at 1.00 instead of 3.1 for copying everything
+  (`RECOMP_DMA_COPYREFS=1`). Everything from game code that reaches the packet path's state waits for the chain first
+  (`DmaSync`): the next send, `sceGsSwapDBuffDc`, texture load/unload/update, model
+  (un)registration, viewport and gamma. Texture `Load` and `RegisterObject` are called ~90 and
+  ~120 times per tick for scenery that is already loaded; those calls do not wait (else the game
+  thread waited 6-8 ms per tick).
+- **Recording:** the vectors handed back by the job pool are reserved to the last frame's size
+  (they grew while recording every frame), parameter sets are built in place and compared inline
+  (matrix first) instead of with `memcmp`.
+- **Batched vertices** (`PreVertex`): normals and UVs as the game's int16 fixed point, scaled back
+  in the batch shader: 24 instead of 32 bytes to copy and upload, exact.
+- Measured and not done: keeping each slot window's geometry on the GPU when the next frame has
+  the same draws in it. While driving only 25-39% of the windows repeat (99% when standing): a
+  model entering or leaving shifts everything after it in the sorted order. 16-bit indices: no
+  base-vertex draws in GLES 3.0, and absolute indices would only fit below 65536 vertices.
+
+Frames identical throughout (maxfps 0, frameskip 0; 0 pixels > 8 at 70, 90, 100 s against the
+previous build, and between repeated runs at 50, 70, 100 s). The route's intro flyover (50 s)
+differs between modes by ~60 pixels but repeats within a mode; it depends on timing (loading
+against ticks): the synchronous build with only the list thread switched off differs by 1575. The R36H throttles to 1008 MHz within
+about a minute of this load even when started cool (55 C), so the comparisons below are at that
+clock (each run started below 55 C):
+
+| | 0.75 | 1.00 |
+|---|---|---|
+| before | 50-58 frames/s, GPU 74% | 43-49, GPU 68% |
+| list thread + DMA thread | 53-56, GPU 81% | 51-53, GPU 83% |
+| + recording, packed vertices, model packets in place | | 52-54, GPU 82-84% |
+
+At 1.00 the critical path is now the DMA thread (~10.5 ms per chain at 1008 MHz plus waiting for
+the render thread) and the GPU (83%); all four cores are busy. The threads cost more CPU in total
+(more heat). For 60 frames/s on the R36H: draw distance 0.60.
+
+### 3j. Automatic draw distance, PSP comparison, options menu (2026-10-16)
+
+**PSP version** (Densha de GO! Pocket Chuo-sen-hen, 2005, same engine), compared with FINAL's
+`cddata/mapdata/chuoA_D`: the same container format (`DAT`: count, then offset/size pairs) and
+76 area packs; `map.dat`'s track/section parts are byte-identical. Objects carry three model slots
+(+0x10 on PC, +0x08 on PSP), which are parts of the object (e.g. a signal's lamp head), not
+levels of detail: neither version has distance LODs. The PSP removed 8% of the objects (trees,
+houses, parked cars, small props, ground pieces), has 27% fewer triangles (1.97 M vs 2.69 M over
+the route; mostly simplified station buildings) and nearly as many draws; its vertices are 12
+bytes (GE vertex type 0x121/0x122: 8-bit UV and normal, 16-bit position, triangle lists).
+
+**The draw distance controller.** Both have the same function (PC `0x47e1d0`, PSP `0x3ef84` in
+BOOT.BIN, an unencrypted MIPS ELF): every tick it compares the frame's load with a budget and
+moves the draw distance by 0.02 (far over or under), 0.008 (under) or |speed| x 0.0016, averaged
+over 60 ticks (PSP 30), between 0.45 and 1.0 (PSP 0.625-1.0). The result scales the base
+distances 300/135/300/500 (PSP 270/135/270/400; the debug line "pow : %3dm" prints x500).
+- PC: load = max(cor, dra), ms x 31.5 / x 3.15 (`0x417510`, `0x417580`); budget from the registry
+  value "rendpow" (`0x4c8c4c` table {0,115..175}, default 155 = 4.9 ms of "cor"). "cor" spans from
+  the end of one frame-driver run to the start of the next, i.e. the whole tick including the
+  frame limiter's wait (~525 at 60 frames/s), so the PC game only ever shrinks: always 0.45.
+- PSP: load = CPU time x 7650/s, budget 215 = 28 ms: it targets 30 frames/s.
+- PC only: after the average, a hold (`0x730c60`) is set the first time the average falls, and the
+  result is capped at the hold, which only ever falls (reset at a route's start, `0x455254`,
+  which also starts the average at 0.65). One loading spike lowered the distance for good.
+
+**Auto now** (`drawdistance = auto`; `original` keeps the old behaviour): `MEM_OVERRIDES` make the
+controller read the host's load, budget, limits and steps from the settings page, and
+`BRANCH_OVERRIDES` 0x47e3d2 never sets the hold (as on the PSP). The load (`DrawLoadTick`) is the
+busiest stage's share of a drawn frame's period, in the controller's units (525 = one period),
+smoothed over ~16 ticks: game thread work over the frame's ticks (it includes waiting for the DMA
+and render threads), the DMA thread's last chain, and the renderer's slowest stage
+(`CGraphic::FrameLoadNs`: list thread, or render thread plus its wait for the GPU to finish the
+previous frame, about max(render thread, GPU)). Budget `ddload` 0.80; limits `ddmin` 0.45,
+`ddmax` 1.0; steps 0.006 down, 0.002 / 0.0008 up per tick (the original's 0.02 crossed the range
+within a second: with the noisier load the distance swung and scenery popped in and out).
+`RECOMP_TRACE_DD=1` prints load, its parts, the distance and the speed every tick. With a fixed
+distance the controller keeps running into the scratch slot, so switching to auto continues from
+an adapted value.
+
+R36H, Osaka Loop drive (Driver Mode), 80-100 s:
+
+| | draw distance | ticks/s | frames shown/s |
+|---|---|---|---|
+| maxfps 30, frameskip 3, auto | 1.00 throughout (load ~45%; CPU at 1512 MHz 98% of the time) | 60 | 29-30 |
+| maxfps 0, frameskip 0, auto | 0.45-0.9, average ~0.62 (stations: game and DMA threads ~20 ms) | 59.1-59.6 | 59 |
+| maxfps 0, fixed 0.60 (3i) | 0.60 | 58-60 | |
+
+**Options menu** (`host/overlay.cpp`; gamepad Y, F10): resolution (after a restart), draw
+distance (auto, or fixed 0.30-1.50), max distance (auto's `ddmax`), frame rate (60/30/20/15) and
+the fps counter (GL). Changes apply at once and are written to graphics.ini when it closes
+(`UpdateIniValues`, only the keys that changed). It is rasterised with its own 5x7 font into a
+264x122 RGBA image that both renderers draw centred at an integer scale over the picture
+(`CGraphic::SetOverlay`). While open the game keeps running without input; after closing, input
+stays blocked until every key is released. `RECOMP_KEYS` can open it with vk 79 (F10).
+
+### 3k. The builder kit: packages from the user's exe without build tools (2026-10-22)
+
+The packages contain the translated game code and cannot be shared. The builder kit is everything
+else, already compiled, so that the step involving the game runs on the player's machine with
+nothing to install: `recomp/builder/make-kit.py <host>...` writes
+`build/kit/ddg-recomp-builder-<host>.(tar.xz|zip)` with
+
+* `python/`: portable CPython 3.12 (python-build-standalone), with capstone unpacked from its wheel
+  into `recomp/pylib`. The Linux libpython is stripped of debug info (203 to 38 MB). Stripping the
+  `python3.12` executable breaks its symbol lookup, so it is left alone.
+* `zig/`: zig 0.14.1 (clang 19, lld), which cross-compiles to `aarch64-linux-gnu.2.28` and
+  `x86_64-linux-gnu.2.35` from any host with its own glibc stubs and libc++. No sysroot or Docker is
+  needed on the user's side. Only the headers of those two targets are kept (the rest is ~100 MB).
+* `recomp/`: the translator (`build_game.py`, `x86lift.py`, `plan.py`, `pe.py`, `exepatch.py`,
+  `data/`, `build/discovered.txt`, `recomp_rt.h`) and `builder/builder.py`.
+* `targets/<handheld|desktop>/`: the host and port objects (`make hostobjs` with zig as CC/CXX; the
+  handheld ones with `-mcpu=cortex_a35` and `linux/perfect.profdata`), `libSDL3.so.0` (from the
+  ddg-recomp-arm64 / ddg-recomp-desktop images), the package's files and `target.json`. The JSON
+  holds the game code's flags (the Makefile's rule for `build/game/*.c`: keep them in step), the
+  link line and the package layout.
+
+`builder.py` runs `build_game.py` with `RECOMP_GAME_DIR` (a work folder), compiles the 21 files in
+parallel (thin LTO, so the compile is quick and the codegen happens at the link), links with the
+kit's objects and writes the zip / tar.gz with the same layout as `linux/package.sh` and
+`linux/build-desktop.sh`. It takes 75-85 s on an 8-core PC, with about 30 s more on the first run,
+when zig builds glibc stubs and libc++ for the target into `cache/`. zig reads the clang 16 profile
+without mismatch warnings.
+
+Checked: the Linux kit, freshly unpacked, builds both packages. The desktop binary drives the
+Osaka loop at 60 ticks/s, and its frame matches the Docker build's (including the sky noise in
+§7 item 10, which both show). Wrong files (not a PE, another program, a truncated exe) are refused with the translator's
+message (`exepatch.normalize` now also rejects patch sites cut off by the end of the file). Not
+checked yet: the zig-built handheld binary on the R36H (clang 19 with libc++ instead of clang 16
+with libstdc++: speed, startup), and the Windows kit on Windows. Under wine the translation runs,
+but zig stops with "unable to find zig self exe path", a wine limitation.
+
+### 3l. The shareable program: translator and compiler built in (RECOMP_JIT, 2026-10-23)
+
+`make RECOMP_JIT=1` builds the program without the game code, so it may be published (the
+release pipeline, `.github/workflows/release.yml`). On the first start with an exe it does what
+the builder does, inside the program:
+
+1. **Translate** (`host/pyembed.cpp`): a static libpython 3.12 (python-build-standalone "full";
+   `host/mkpyruntime.py` writes a module table with only the 46 built-in modules the translator
+   and Python's start-up need, so OpenSSL, SQLite and Tk stay out, and `link.txt` from
+   `PYTHON.json`) runs `build_game.py`. The standard library modules it imports (2.1 MB zipped),
+   the translator and capstone are in `runtime.bin`, embedded with `.incbin` and unpacked into the
+   cache once. Paths go to Python as variables of `__main__`: `setenv()` on the translating thread
+   raced with `getenv()` in SDL and the settings window.
+2. **Compile** (`host/jit.cpp`): clang as a library, the cc1 options clang 23 uses for the
+   Makefile's `build/game/*.c` rule (without the stack protector), one thread per core, the C
+   library declarations built in (no system headers needed).
+3. **Link**: LLVM's JIT (LLJIT/JITLink) adds the objects to the running program. Host symbols
+   come from the program (`--export-dynamic-symbol` for `N_*`, `R`, `RT_*`, `rt_*`, so that
+   `--gc-sections` can drop the unused parts of LLVM). `native_info.c` defines every native
+   weakly (a trap) for the static linker to replace: the JIT keeps the first definition, so the
+   program's natives are defined first. The tables runtime.c needs (`RT_TABLE`, `rt_exe_*`) are
+   looked up afterwards (`rt_jit_sym`).
+
+Caches (`~/.cache/ddg-recomp`, macOS `~/Library/Caches/ddg-recomp`): `runtime-<hash>` (the
+unpacked translator), `game-<hash of exe and runtime>/src` (the C; `.ready` once compiled),
+`jit-<hash of the C, the header and LLVM's version>` (the objects). Before the game code exists
+`rt_check_exe` only checks for a PE file without SafeDisc; the translator checks the version and
+the full check runs after loading.
+
+The settings window prepares the game code in the background (`LauncherPrepare`: translating,
+"Compiling 7 of 21 files", Ready; Start waits for it) and opens on its own while an exe has no
+game code yet. It now also has the exe path and the options menu's settings (max distance, frame
+rate, fps counter). Test hooks: `RECOMP_LAUNCHER_SHOT=<s>,...` (saves the window as
+launcher-<n>.bmp), `RECOMP_LAUNCHER_AUTOSTART=1`.
+
+Measured on the PC (Ryzen 7 4750U, 16 threads), static LLVM 23.1.1 (x86 only):
+
+| | |
+|---|---|
+| first start, 16 threads | 48 s (translation ~27 s, compile 19.7 s) |
+| first start, 4 cores (`taskset -c 0-3`) | 65 s (compile 34.5 s) |
+| later starts | +0.1 s (objects from the cache, link 40 ms) |
+| game code per tick, Osaka loop drive | 1.5-1.9 ms, as the normal clang build; frame identical |
+| program, stripped | 106 MB (LLVM/clang ~75 MB, runtime.bin 12.7 MB); 27 MB as .tar.xz |
+
+python-build-standalone's static libpython exists only as clang 20 LTO bitcode: the link needs
+clang/lld 20 or newer (the release scripts use LLVM 23 from apt.llvm.org and Homebrew). The
+release scripts (`recomp/linux/release-deps.sh`, `build-release.sh`, `recomp/macos/build-release.sh`)
+pack the program with SDL3, README-release.txt, SOURCE.txt (the commit, for the GPL) and the
+licences of everything inside. The macOS script has not run yet (no Mac here): its first runs on
+the GitHub runner will show what is missing.
+
 ## 4. How the recompiler works (essentials)
 
 * **Translation** (`x86lift.py`): one C function `F_xxxxxxxx` per x86 function. Registers are
@@ -678,7 +969,7 @@ reproducible):
 | `RECOMP_TRACE_SPIKES=<ms>` | breakdown of every tick / GL job slower than that |
 | `RECOMP_GL_THREADED=0\|1`, `RECOMP_GL_SLOW=<ms>` | GL render thread off/on; delay per frame on it (slow-GPU imitation) |
 | `RECOMP_GL_DEBUG=<bits>` | GL renderer: 1 no culling, 2 no depth test, 4 opposite cull direction |
-| `RECOMP_GL_EXP=<bits>` | GL GPU-cost split: 1 trivial fragment shader, 2 draws scissored to 1 pixel, 4 no present blit |
+| `RECOMP_GL_EXP=<bits>` | GL GPU-cost split: 1 trivial fragment shader, 2 draws scissored to 1 pixel, 4 no present blit; leave out 8 2D draws, 16 blended, 32 alpha-tested, 64 opaque mesh draws, 128 full-screen 2D quads, 256 the other 2D draws (see 3h) |
 | `RECOMP_GL_ASYNC_PRESENT=0`, `RECOMP_GL_NO_SHADER_CACHE`, `RECOMP_GL_NO_TEXARRAYS` | GL: present on the render thread; no `shaders.bin`; texture arrays off even if `texarrays = 1` |
 | graphics.ini `maxfps = <n>` | draw at most n frames per second (60/n ticks apart), game logic stays at 60 Hz |
 | `RECOMP_GL_EARLY_UPLOADS=0`, `RECOMP_GL_UPLOAD_BUDGET=<ms>` | GL: no texture uploads ahead / stand-ins (3b, scenery changes); per-frame upload time before model textures get stand-ins (default 3, 0 = always wait) |
@@ -790,6 +1081,10 @@ Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SA
 8. 118 functions fail translation (MMX/SSE/3DNow! D3DX math). Not hit so far; if a trap reports
    one, add the instructions to `x86lift.py` or make the function native.
 9. The debug hooks in §6 are compiled in permanently; they cost nothing unless set.
+10. **Noise in the sky with the SDL GPU renderer on Vulkan** (desktop Linux, 2026-10-22): in the
+   Osaka loop drive at 85 s, the upper part of the sky shows coloured random pixels in the
+   snapshot (`RECOMP_SHOT_AFTER`), with the Docker build and with the builder's. The GL builds
+   draw it correctly. Probably an uninitialised texture or render target. Not looked into yet.
 
 How to tackle a new crash: run `./iterate.sh` (handles discovery); for other traps read the
 backtrace (`stack:` list of return addresses), look the function up in Ghidra (or a local `out/perfect_all.c`), and
