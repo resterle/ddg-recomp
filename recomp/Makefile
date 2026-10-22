@@ -69,7 +69,8 @@ JIT_CXXFLAGS := -I$(LLVM_PREFIX)/include -std=c++17 -D_GNU_SOURCE -D__STDC_CONST
 # exported for the game code (the JIT finds the host by dlsym): only the runtime's interface, so
 # that the linker can drop the unused parts of LLVM and clang. LLVM_SYSLIBS: what the LLVM build
 # needs besides (llvm-config --link-static --system-libs, e.g. -lz -lzstd)
-LLVM_ARCHIVES := $(filter-out %/libclang.a,$(wildcard $(LLVM_PREFIX)/lib/libclang*.a $(LLVM_PREFIX)/lib/libLLVM*.a))
+# (libPolly*: Homebrew's LLVM is built with Polly, which its pass builder then calls)
+LLVM_ARCHIVES := $(filter-out %/libclang.a,$(wildcard $(LLVM_PREFIX)/lib/libclang*.a $(LLVM_PREFIX)/lib/libLLVM*.a $(LLVM_PREFIX)/lib/libPolly*.a))
 ifeq ($(shell uname -s),Darwin)
 JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,-exported_symbols_list,host/jit-exports-macos.txt -Wl,-dead_strip -lpthread -lm
 else
@@ -131,9 +132,14 @@ $(OBJ)/host/rt_header.c: recomp_rt.h
 $(OBJ)/host/rt_header.o: $(OBJ)/host/rt_header.c
 	$(CC) -c $< -o $@
 
-# the translator runtime (stdlib subset, translator, capstone) and Python's module table
-$(OBJ)/py/runtime.bin $(OBJ)/py/pyconfig.c $(OBJ)/py/link.txt: host/mkpyruntime.py $(wildcard *.py data/*) build/discovered.txt
+# the translator runtime (stdlib subset, translator, capstone) and Python's module table: one
+# run writes all three files (runtime.bin owns the recipe; with three targets on one rule, make -j
+# ran it three times at once, and the runs collided unpacking capstone)
+$(OBJ)/py/runtime.bin: host/mkpyruntime.py $(wildcard *.py data/*) build/discovered.txt
 	$(PY_PREFIX)/install/bin/python3 host/mkpyruntime.py $(PY_PREFIX) $(CAPSTONE_WHEEL) $(OBJ)/py
+
+$(OBJ)/py/pyconfig.c $(OBJ)/py/link.txt: $(OBJ)/py/runtime.bin
+	@:
 
 $(OBJ)/py/pyconfig.o: $(OBJ)/py/pyconfig.c
 	$(CC) -O2 -I$(PY_PREFIX)/install/include/python3.12 -I$(PY_PREFIX)/install/include/python3.12/internal -DPy_BUILD_CORE -c $< -o $@

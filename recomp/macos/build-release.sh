@@ -3,8 +3,10 @@
 # translates the player's perfect.exe and compiles it on the first start) as an app bundle:
 #   recomp/build/ddg-recomp-macos-arm64.zip: Densha de GO! FINAL.app (Contents/MacOS/perfect_recomp,
 #   Frameworks/libSDL3.0.dylib, Resources/LICENSES, README.txt, SOURCE.txt)
-# Needs Homebrew's llvm and lld (clang and lld read python-build-standalone's LLVM bitcode, and
-# llvm's static libraries are linked in), cmake and ninja. Used by .github/workflows/release.yml.
+# Needs Homebrew's llvm (its clang and libLTO read python-build-standalone's LLVM bitcode, and
+# llvm's static libraries are linked in), zstd, cmake and ninja. Linked with Apple's ld using
+# Homebrew's libLTO: ld64.lld left a dozen of libpython's own functions undefined (PyErr_Print,
+# PyThreadState_New, ...) even for a three-line program. Used by .github/workflows/release.yml.
 # Not yet tested on a Mac (only the Linux build was run): see docs/DEVELOPMENT.md.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,7 +19,6 @@ PY_RELEASE=20250612
 PY_VERSION=3.12.11
 CAPSTONE=5.0.9
 llvm=$(brew --prefix llvm)
-lld=$(brew --prefix lld)
 major=$("$llvm/bin/llvm-config" --version | cut -d. -f1)
 [ "$major" = 23 ] || { echo "Homebrew llvm is $major; host/jit.cpp is written for LLVM 23" >&2; exit 1; }
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}    # Homebrew's LLVM libraries
@@ -48,10 +49,10 @@ fi
 # the program (Metal renderer)
 rm -f "$out/perfect_recomp"
 make -j"$(sysctl -n hw.ncpu)" RECOMP_JIT=1 RENDERER=gpu CC="$llvm/bin/clang" CXX="$llvm/bin/clang++" \
-    LLVM_PREFIX="$llvm" LLVM_SYSLIBS="$("$llvm/bin/llvm-config" --link-static --system-libs)" \
+    LLVM_PREFIX="$llvm" LLVM_SYSLIBS="-L$(brew --prefix zstd)/lib $("$llvm/bin/llvm-config" --link-static --system-libs)" \
     PY_PREFIX="$cache/pbs/python" CAPSTONE_WHEEL="$(ls "$cache"/capstone/*.whl | head -1)" \
     SDL_PREFIX="$cache/sdl3" SDL_LIBS="-L$cache/sdl3/lib -lSDL3" OBJ=build/obj-release-macos-arm64 \
-    TARGET="$out/perfect_recomp" LDEXTRA="-fuse-ld=$lld/bin/ld64.lld -Wl,-rpath,@executable_path/../Frameworks"
+    TARGET="$out/perfect_recomp" LDEXTRA="-fuse-ld=ld -Wl,-lto_library,$llvm/lib/libLTO.dylib -Wl,-rpath,@executable_path/../Frameworks"
 
 # the app bundle
 app="$out/Densha de GO! FINAL.app"
