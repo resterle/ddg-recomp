@@ -65,9 +65,9 @@ cp "$cache/sdl3/LICENSE.txt" "$pkg/LICENSES/SDL3-zlib.txt"
 cp "$recomp/data/ddgmodernizer-LICENSE.md" "$pkg/LICENSES/DDGModernizer-MIT.md"
 cp "$cache/pbs/python/install/lib/python3.12/LICENSE.txt" "$pkg/LICENSES/Python-PSF.txt"
 [ -d "$cache/pbs/python/licenses" ] && cp -r "$cache/pbs/python/licenses" "$pkg/LICENSES/python-build-standalone"
-unzip -p "$(ls "$cache"/capstone/*.whl | head -1)" '*/LICENSE*' > "$pkg/LICENSES/capstone-BSD.txt" 2>/dev/null || true
+python3 -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); sys.stdout.buffer.write(z.read(next(n for n in z.namelist() if '.dist-info/LICENSE' in n)))" "$(ls "$cache"/capstone/*.whl | head -1)" > "$pkg/LICENSES/capstone-BSD.txt"
 curl -fsSL "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.1/llvm/LICENSE.TXT" -o "$pkg/LICENSES/LLVM-Apache-2.0-with-LLVM-exception.txt"
-commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
+commit=$(git -c safe.directory="$root" -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
 cat > "$pkg/SOURCE.txt" <<EOF
 ddg-recomp is free software under the GNU General Public License v3 (LICENSES/).
 This program was built from https://github.com/resterle/ddg-recomp, commit $commit,

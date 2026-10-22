@@ -94,7 +94,6 @@ struct DrawCmd {
     SDL_Rect        scissor;
     CGraphicMesh   *pMesh;          // set for 3D model draws
     uint32_t        meshParams;     // index into Impl::meshParams
-    bool            copyTarget;     // samples the render target: copy it to pTargetCopy first
 };
 
 constexpr uint64_t kKeyMesh = 1ull << 24;
@@ -142,6 +141,7 @@ struct CGraphic::Impl {
     SDL_GPUSampler *pPresentSampler = nullptr;
     SDL_GPUSampler *pOverlaySampler = nullptr;      // nearest (CGraphic::SetOverlay)
     SDL_GPUTexture *pOverlayTex = nullptr;
+    CGraphicTexture *pFeedback = nullptr;           // copy of the target for draws that sample it (FeedbackCopy)
     int overlayTexW = 0, overlayTexH = 0;
     uint32_t overlayVersion = 0;
 
@@ -149,7 +149,6 @@ struct CGraphic::Impl {
     SDL_GPUTexture *pDepth = nullptr;
     SDL_GPUTexture *pWhite = nullptr;               // bound when drawing untextured
     SDL_GPUTexture *pPaletteAtlas = nullptr;
-    SDL_GPUTexture *pTargetCopy = nullptr;          // what a draw sampling its own target reads
     std::vector<uint8_t> paletteCPU;                // kPaletteAtlasW * kPaletteAtlasH * 4
     std::vector<uint32_t> dirtyPalettes;
     std::vector<bool> paletteDirty;
@@ -691,16 +690,7 @@ static bool Flush()
         do {
             bool mesh = i < n && g->draws[i].pMesh != nullptr;
             size_t e = i;
-            while (e < n && (g->draws[e].pMesh != nullptr) == mesh && (e == i || !g->draws[e].copyTarget)) e++;
-            if (i < n && g->draws[i].copyTarget) {
-                // a draw sampling the target starts a new pass, after a copy of the target so far
-                SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
-                SDL_GPUTextureLocation src = {}, dst = {};
-                src.texture = rt.pTex;
-                dst.texture = g->pTargetCopy;
-                SDL_CopyGPUTextureToTexture(copy, &src, &dst, rt.nWidth, rt.nHeight, 1, false);
-                SDL_EndGPUCopyPass(copy);
-            }
+            while (e < n && (g->draws[e].pMesh != nullptr) == mesh) e++;
 
             SDL_GPUColorTargetInfo color = {};
             color.texture = rt.pTex;
@@ -804,14 +794,6 @@ static void FillTexture(DrawCmd &d)
         CGraphicTexture &t = *g->pCurTex;
         bool linear = s.magFilter == TEXF_LINEAR || s.minFilter == TEXF_LINEAR;
         d.pTex = t.pTex;
-        // The screen effect blends the scene into itself (texture slot 0 while rendering to slot 0,
-        // shifted by 1.5 lines). Sampling the target being drawn is undefined; Apple GPUs return
-        // garbage along 32-pixel tile rows (the magenta lines in the sky). Sample a copy taken
-        // right before the draw instead, which is what the original's D3D8 hardware showed.
-        if (&t == g->tex[g->target]) {
-            d.pTex = g->pTargetCopy;
-            d.copyTarget = true;
-        }
         d.pSampler = GetSampler(s.addrU, s.addrV, linear);
         d.fs.mode = t.nFormat == TEXFMT_P8 ? 2 : 1;
         d.fs.addrU = s.addrU;
@@ -829,9 +811,49 @@ static void FillTexture(DrawCmd &d)
     }
 }
 
+// A draw that samples the scene target it draws into: the game blends its own picture onto itself
+// (shifted by a line, at half strength, to soften it). A color target read in its own render pass
+// is undefined in Vulkan (noise over the sky) and Metal; the PS2 read what was drawn so far. So:
+// flush the recorded draws, copy the target and let the draw read the copy.
+static CGraphicTexture *MakeRenderTarget(uint32_t w, uint32_t h);
+
+static CGraphicTexture *FeedbackCopy()
+{
+    CGraphicTexture &rt = *g->tex[g->target];
+    if (!Flush()) return nullptr;
+    SDL_GPUDevice *dev = CGraphic::GetDevice();
+    if (g->pFeedback && (g->pFeedback->nWidth != rt.nWidth || g->pFeedback->nHeight != rt.nHeight)) {
+        SDL_ReleaseGPUTexture(dev, g->pFeedback->pTex);
+        delete g->pFeedback;
+        g->pFeedback = nullptr;
+    }
+    if (!g->pFeedback && !(g->pFeedback = MakeRenderTarget(rt.nWidth, rt.nHeight))) return nullptr;
+    g->pFeedback->nUVWidth = rt.nUVWidth;
+    g->pFeedback->nUVHeight = rt.nUVHeight;
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
+    if (!cmd) return nullptr;
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureLocation src = {}, dst = {};
+    src.texture = rt.pTex;
+    dst.texture = g->pFeedback->pTex;
+    SDL_CopyGPUTextureToTexture(copy, &src, &dst, rt.nWidth, rt.nHeight, 1, false);
+    SDL_EndGPUCopyPass(copy);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) return nullptr;
+    return g->pFeedback;
+}
+
 // Record vertices for the current state. Fans become lists because SDL GPU has no fan topology.
 static bool Record(const Vertex *v, uint32_t n)
 {
+    // sampling the target being drawn into: read a copy of it (FeedbackCopy)
+    CGraphicTexture *sampled = g->pCurTex;
+    if (g->textured && sampled && sampled == g->tex[g->target]) {
+        CGraphicTexture *copy = FeedbackCopy();
+        if (!copy) return false;
+        g->pCurTex = copy;
+    }
+    struct Restore { CGraphicTexture *&p; CGraphicTexture *v; ~Restore() { p = v; } } restore{g->pCurTex, sampled};
+
     if (CACHED_ENV("RECOMP_SKIP_2D") && g_frameSerial >= strtoul(CACHED_ENV("RECOMP_SKIP_2D"), nullptr, 10)) return true;   // debugging
     // debugging: RECOMP_SKIP_2D_SEQ="<first frame>:<step>" skips 2D draws [k*step, (k+1)*step) of each
     // frame during the k-th block of 60 frames
@@ -1044,11 +1066,10 @@ bool CGraphic::Init(SDL_Window *window)
     g->tex[1] = MakeRenderTarget(w, h);
     if (!g->tex[0] || !g->tex[1]) return FAIL("render targets");
     g->pDepth = MakeGPUTexture(g->depthFormat, w, h, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
-    g->pTargetCopy = MakeGPUTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, w, h, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     g->pPaletteAtlas = MakeGPUTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, kPaletteAtlasW, kPaletteAtlasH,
                                       SDL_GPU_TEXTUREUSAGE_SAMPLER);
     CGraphicTexture *white = CreateTexture(1, 1, TEXFMT_BGRA8);
-    if (!g->pDepth || !g->pTargetCopy || !g->pPaletteAtlas || !white) return FAIL("SDL_CreateGPUTexture");
+    if (!g->pDepth || !g->pPaletteAtlas || !white) return FAIL("SDL_CreateGPUTexture");
     white->staging = {0xff, 0xff, 0xff, 0xff};
 
     // Upload the white texel and clear both scene targets.
@@ -1093,12 +1114,13 @@ void CGraphic::Term()
         if (g->pPresentSampler) SDL_ReleaseGPUSampler(m_pDevice, g->pPresentSampler);
         if (g->pOverlaySampler) SDL_ReleaseGPUSampler(m_pDevice, g->pOverlaySampler);
         if (g->pOverlayTex) SDL_ReleaseGPUTexture(m_pDevice, g->pOverlayTex);
+        if (g->pFeedback) { SDL_ReleaseGPUTexture(m_pDevice, g->pFeedback->pTex); delete g->pFeedback; }
         for (SDL_GPUShader *s : {g->pVS[0], g->pVS[1], g->pFS[0], g->pFS[1], g->pMeshVS[0], g->pMeshVS[1],
                                  g->pMeshFS[0], g->pMeshFS[1], g->pPresentVS, g->pPresentFS})
             if (s) SDL_ReleaseGPUShader(m_pDevice, s);
         for (CGraphicMesh *m : g->meshes) delete m;
         if (g->pMeshArena) SDL_ReleaseGPUBuffer(m_pDevice, g->pMeshArena);
-        for (SDL_GPUTexture *t : {g->pDepth, g->pTargetCopy, g->pWhite, g->pPaletteAtlas}) if (t) SDL_ReleaseGPUTexture(m_pDevice, t);
+        for (SDL_GPUTexture *t : {g->pDepth, g->pWhite, g->pPaletteAtlas}) if (t) SDL_ReleaseGPUTexture(m_pDevice, t);
         if (g->pVB) SDL_ReleaseGPUBuffer(m_pDevice, g->pVB);
         if (g->pUpload) SDL_ReleaseGPUTransferBuffer(m_pDevice, g->pUpload);
         if (g->pWindow) SDL_ReleaseWindowFromGPUDevice(m_pDevice, g->pWindow);

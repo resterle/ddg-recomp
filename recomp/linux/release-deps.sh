@@ -16,5 +16,5 @@ curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | $SUDO te
 echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-23 main" |
     $SUDO tee /etc/apt/sources.list.d/llvm.list >/dev/null
 $SUDO apt-get update -qq
-$SUDO apt-get install -y -qq --no-install-recommends clang-23 lld-23 llvm-23-dev libclang-23-dev >/dev/null
+$SUDO apt-get install -y -qq --no-install-recommends clang-23 lld-23 llvm-23-dev libclang-23-dev libpolly-23-dev >/dev/null
 echo "tools: $(clang-23 --version | head -1)"

@@ -69,13 +69,13 @@ JIT_CXXFLAGS := -I$(LLVM_PREFIX)/include -std=c++17 -D_GNU_SOURCE -D__STDC_CONST
 # exported for the game code (the JIT finds the host by dlsym): only the runtime's interface, so
 # that the linker can drop the unused parts of LLVM and clang. LLVM_SYSLIBS: what the LLVM build
 # needs besides (llvm-config --link-static --system-libs, e.g. -lz -lzstd)
-# (libPolly*: Homebrew's LLVM is built with Polly, which its pass builder then calls)
+# (libPolly*: Homebrew's and apt.llvm.org's LLVM are built with Polly, which the pass builder calls)
 LLVM_ARCHIVES := $(filter-out %/libclang.a,$(wildcard $(LLVM_PREFIX)/lib/libclang*.a $(LLVM_PREFIX)/lib/libLLVM*.a $(LLVM_PREFIX)/lib/libPolly*.a))
 ifeq ($(shell uname -s),Darwin)
-JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,-exported_symbols_list,host/jit-exports-macos.txt -Wl,-dead_strip -lpthread -lm
+JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,-exported_symbols_list,host/jit-exports-macos.txt -Wl,-dead_strip -Wl,-dead_strip_dylibs -lpthread -lm
 else
 JIT_EXPORTS := -Wl,--export-dynamic-symbol=N_* -Wl,--export-dynamic-symbol=R -Wl,--export-dynamic-symbol=RT_* -Wl,--export-dynamic-symbol=rt_*
-JIT_LIBS   = $(PY_LIBS) -Wl,--start-group $(LLVM_ARCHIVES) -Wl,--end-group $(LLVM_SYSLIBS) $(JIT_EXPORTS) -Wl,--gc-sections -ldl -lpthread -lm
+JIT_LIBS   = $(PY_LIBS) -Wl,--start-group $(LLVM_ARCHIVES) -Wl,--end-group -Wl,--as-needed $(LLVM_SYSLIBS) -Wl,--no-as-needed $(JIT_EXPORTS) -Wl,--gc-sections -ldl -lpthread -lm
 endif
 else
 JIT_CXXFLAGS := $(shell $(LLVM_CONFIG) --cxxflags)
@@ -132,9 +132,8 @@ $(OBJ)/host/rt_header.c: recomp_rt.h
 $(OBJ)/host/rt_header.o: $(OBJ)/host/rt_header.c
 	$(CC) -c $< -o $@
 
-# the translator runtime (stdlib subset, translator, capstone) and Python's module table: one
-# run writes all three files (runtime.bin owns the recipe; with three targets on one rule, make -j
-# ran it three times at once, and the runs collided unpacking capstone)
+# the translator runtime (stdlib subset, translator, capstone) and Python's module table; one run
+# writes all three (the others hang off runtime.bin: make 3.81 has no grouped targets)
 $(OBJ)/py/runtime.bin: host/mkpyruntime.py $(wildcard *.py data/*) build/discovered.txt
 	$(PY_PREFIX)/install/bin/python3 host/mkpyruntime.py $(PY_PREFIX) $(CAPSTONE_WHEEL) $(OBJ)/py
 
