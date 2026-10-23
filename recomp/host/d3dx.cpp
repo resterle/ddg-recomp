@@ -143,6 +143,9 @@ static void SinCos(float angle, float *s, float *c)
     double sd, cd;
 #ifdef __APPLE__
     __sincos((double)angle, &sd, &cd);
+#elif defined(_MSC_VER)                 // the MSVC C library has no sincos
+    sd = sin((double)angle);
+    cd = cos((double)angle);
 #else
     sincos((double)angle, &sd, &cd);
 #endif

@@ -14,6 +14,8 @@
 #include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -26,8 +28,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <cstdarg>
+#include <cstring>
 #include <dirent.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -35,6 +42,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 extern "C" const char rt_jit_header[];      // recomp_rt.h (rt_header.c, Makefile)
@@ -93,7 +101,9 @@ static const char *const kHeaders[][2] = {
      "double log(double), log2(double), log10(double), exp(double), pow(double, double);\n"
      "float sqrtf(float), floorf(float), ceilf(float), fabsf(float);\n"},
     {"stdio.h",
-#ifdef __APPLE__
+#if defined(_WIN32)
+     "#pragma once\ntypedef struct _iobuf FILE;\nFILE *__acrt_iob_func(unsigned);\n#define stderr (__acrt_iob_func(2))\n"
+#elif defined(__APPLE__)
      "#pragma once\ntypedef struct __sFILE FILE;\nextern FILE *__stderrp;\n#define stderr __stderrp\n"
 #else
      "#pragma once\ntypedef struct _IO_FILE FILE;\nextern FILE *stderr;\n"
@@ -139,6 +149,128 @@ static void mkdirs(const std::string &path)
 #define kFramePointer "non-leaf"
 #endif
 
+#ifdef _WIN32
+// Windows: the C library is linked into the program statically and not exported, so the JIT gets
+// the functions the translated code calls from this table (the runtime's own interface it finds
+// among the program's exports). The code is placed within 2 GB of the program (it calls and reads
+// the program with 32-bit offsets) and its unwind tables are registered (longjmp unwinds across
+// it on a guest thread's exit). host/os_win.c does the Windows side.
+extern "C" {
+void *rt_win_exe_symbol(const char *name);
+void *rt_win_jit_alloc(size_t size);
+int rt_win_jit_protect(void *p, size_t size, unsigned prot);
+int rt_win_jit_unwind(void *pdata, size_t size, uint64_t base);
+void __chkstk(void);
+extern int _fltused;
+}
+
+static int jitFprintf(FILE *f, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfprintf(f, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+static int jitPrintf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+static void addCLibrary(llvm::orc::LLJIT &J, llvm::orc::SymbolMap &m)
+{
+    using D1 = double (*)(double);
+    using D2 = double (*)(double, double);
+    using F1 = float (*)(float);
+    const std::pair<const char *, void *> table[] = {
+        {"memcpy", (void *)memcpy}, {"memmove", (void *)memmove}, {"memset", (void *)memset},
+        {"memcmp", (void *)memcmp}, {"strlen", (void *)strlen},
+        {"sqrt", (void *)(D1)sqrt}, {"sin", (void *)(D1)sin}, {"cos", (void *)(D1)cos}, {"tan", (void *)(D1)tan},
+        {"atan", (void *)(D1)atan}, {"atan2", (void *)(D2)atan2}, {"floor", (void *)(D1)floor},
+        {"ceil", (void *)(D1)ceil}, {"trunc", (void *)(D1)trunc}, {"nearbyint", (void *)(D1)nearbyint},
+        {"rint", (void *)(D1)rint}, {"round", (void *)(D1)round}, {"fabs", (void *)(D1)fabs},
+        {"fmod", (void *)(D2)fmod}, {"ldexp", (void *)(double (*)(double, int))ldexp},
+        {"frexp", (void *)(double (*)(double, int *))frexp}, {"log", (void *)(D1)log}, {"log2", (void *)(D1)log2},
+        {"log10", (void *)(D1)log10}, {"exp", (void *)(D1)exp}, {"pow", (void *)(D2)pow},
+        {"sqrtf", (void *)(F1)sqrtf}, {"floorf", (void *)(F1)floorf}, {"ceilf", (void *)(F1)ceilf},
+        {"fabsf", (void *)(F1)fabsf},
+        {"fprintf", (void *)jitFprintf}, {"printf", (void *)jitPrintf}, {"__acrt_iob_func", (void *)__acrt_iob_func},
+        {"getenv", (void *)getenv}, {"abort", (void *)abort}, {"exit", (void *)exit},
+        {"malloc", (void *)malloc}, {"free", (void *)free},
+        {"__chkstk", (void *)__chkstk}, {"_fltused", (void *)&_fltused},
+    };
+    for (auto &e : table)
+        m[J.getExecutionSession().intern(e.first)] = {llvm::orc::ExecutorAddr::fromPtr(e.second), llvm::JITSymbolFlags::Exported};
+}
+
+// SectionMemoryManager on memory near the program, registering each object's .pdata
+class NearMapper : public llvm::SectionMemoryManager::MemoryMapper {
+public:
+    llvm::sys::MemoryBlock allocateMappedMemory(llvm::SectionMemoryManager::AllocationPurpose, size_t n,
+                                                const llvm::sys::MemoryBlock *, unsigned, std::error_code &ec) override
+    {
+        void *p = rt_win_jit_alloc(n);
+        if (!p) { ec = std::make_error_code(std::errc::not_enough_memory); return {}; }
+        ec = {};
+        return llvm::sys::MemoryBlock(p, (n + 0xffff) & ~(size_t)0xffff);
+    }
+    std::error_code protectMappedMemory(const llvm::sys::MemoryBlock &b, unsigned flags) override
+    {
+        unsigned prot = ((flags & llvm::sys::Memory::MF_READ) ? 1 : 0) | ((flags & llvm::sys::Memory::MF_WRITE) ? 2 : 0) |
+                        ((flags & llvm::sys::Memory::MF_EXEC) ? 4 : 0);
+        return rt_win_jit_protect(b.base(), b.allocatedSize(), prot) ? std::make_error_code(std::errc::permission_denied) : std::error_code();
+    }
+    std::error_code releaseMappedMemory(llvm::sys::MemoryBlock &) override { return {}; }    // kept for the program's life
+};
+
+class NearMemoryManager : public llvm::SectionMemoryManager {
+public:
+    NearMemoryManager() : llvm::SectionMemoryManager(&mapper()) {}
+    uint8_t *allocateCodeSection(uintptr_t size, unsigned align, unsigned id, llvm::StringRef name) override
+    {
+        return note(llvm::SectionMemoryManager::allocateCodeSection(size, align, id, name), size, name, "code");
+    }
+    uint8_t *allocateDataSection(uintptr_t size, unsigned align, unsigned id, llvm::StringRef name, bool ro) override
+    {
+        return note(llvm::SectionMemoryManager::allocateDataSection(size, align, id, name, ro), size, name, ro ? "ro" : "rw");
+    }
+    // RuntimeDyld passes the object's .pdata here; its entries are relative to the object's lowest
+    // section (RuntimeDyldCOFFX86_64::getImageBase)
+    void registerEHFrames(uint8_t *addr, uint64_t, size_t size) override
+    {
+        if (getenv("RECOMP_JIT_TRACE")) fprintf(stderr, "jit %p pdata %p %zx base %llx\n", (void *)this, addr, size, (unsigned long long)base_);
+        if (rt_win_jit_unwind(addr, size, base_)) fprintf(stderr, "game code: unwind table not registered\n");
+    }
+    void deregisterEHFrames() override {}
+
+private:
+    static NearMapper &mapper() { static NearMapper m; return m; }
+    uint8_t *note(uint8_t *p, uintptr_t size, llvm::StringRef name, const char *kind)
+    {
+        if (getenv("RECOMP_JIT_TRACE")) fprintf(stderr, "jit %p %p %8llx %s %s\n", (void *)this, p, (unsigned long long)size, kind, name.str().c_str());
+        if (p && (uint64_t)(uintptr_t)p < base_) base_ = (uint64_t)(uintptr_t)p;
+        return p;
+    }
+    uint64_t base_ = ~0ull;
+};
+
+static void *hostSymbol(const char *name) { return rt_win_exe_symbol(name); }
+#else
+static void *hostSymbol(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+#endif
+
+// The built-in headers' (virtual) folder: an absolute path (Windows: with a drive)
+#ifdef _WIN32
+static const char kIncDir[] = "C:/ddg-include";
+#else
+static const char kIncDir[] = "/ddg-include";
+#endif
+
 // One translated file -> an object (in memory). Thread-safe: each call has its own compiler.
 static bool compileOne(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs, const std::string &src,
                        const std::string &srcDir, llvm::SmallVectorImpl<char> &obj, std::string &diag)
@@ -149,7 +281,12 @@ static bool compileOne(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs, cons
         "-mframe-pointer=" kFramePointer, "-relaxed-aliasing", "-fmath-errno", "-ffp-contract=on", "-fno-rounding-math",
         "-target-cpu", kTargetCpu, "-vectorize-loops", "-vectorize-slp",
         "-D", "RT_MEM_BASE=" STR(RT_MEM_BASE), "-nostdsysteminc", "-nobuiltininc",
-        "-isystem", "/ddg-include", "-I", srcDir.c_str(), "-w", "-x", "c", src.c_str()};
+        "-isystem", kIncDir, "-I", srcDir.c_str(), "-w",
+#ifdef _WIN32
+        // unwind tables (.pdata/.xdata) as clang's driver adds them for Windows; R through its address
+        "-funwind-tables=2", "-D", "RT_HOST_DATA=__attribute__((dllimport))",
+#endif
+        "-x", "c", src.c_str()};
     llvm::raw_string_ostream ds(diag);
     clang::DiagnosticOptions dopts;
     auto *printer = new clang::TextDiagnosticPrinter(ds, dopts);
@@ -205,8 +342,8 @@ static int load(const std::string &srcDir)
     if (!cached) {
         // the built-in headers over the real file system (the sources)
         auto mem = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
-        for (auto &h : kHeaders) mem->addFile(std::string("/ddg-include/") + h[0], 0, llvm::MemoryBuffer::getMemBuffer(h[1]));
-        mem->addFile("/ddg-include/recomp_rt.h", 0, llvm::MemoryBuffer::getMemBuffer(rt_jit_header));
+        for (auto &h : kHeaders) mem->addFile(std::string(kIncDir) + "/" + h[0], 0, llvm::MemoryBuffer::getMemBuffer(h[1]));
+        mem->addFile(std::string(kIncDir) + "/recomp_rt.h", 0, llvm::MemoryBuffer::getMemBuffer(rt_jit_header));
         auto vfs = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
         vfs->pushOverlay(mem);
         // biggest files first, so the threads finish together
@@ -260,7 +397,18 @@ static int load(const std::string &srcDir)
     auto t1 = clock::now();
     progress("Loading the game code");
 
-    auto jit = llvm::orc::LLJITBuilder().create();
+    llvm::orc::LLJITBuilder builder;
+#ifdef _WIN32
+    builder.setObjectLinkingLayerCreator([](llvm::orc::ExecutionSession &es, llvm::jitlink::JITLinkMemoryManager &) -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+        auto layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(es, [](const llvm::MemoryBuffer &) {
+            return std::make_unique<NearMemoryManager>();
+        });
+        layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
+        layer->setAutoClaimResponsibilityForObjectSymbols(true);
+        return std::move(layer);
+    });
+#endif
+    auto jit = builder.create();
     if (!jit) { fprintf(stderr, "game code: %s\n", llvm::toString(jit.takeError()).c_str()); return 0; }
     auto &J = **jit;
     auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(J.getDataLayout().getGlobalPrefix());
@@ -270,13 +418,18 @@ static int load(const std::string &srcDir)
     // take the program's own instead. The JIT keeps the first definition: define the program's
     // ones first, and the weak ones in the objects are dropped.
     llvm::orc::SymbolMap natives;
+#ifdef _WIN32
+    addCLibrary(J, natives);
+#endif
     for (auto &o : objs) {
         auto file = llvm::object::ObjectFile::createObjectFile(o->getMemBufferRef());
         if (!file) { llvm::consumeError(file.takeError()); continue; }
         for (const llvm::object::SymbolRef &sym : (*file)->symbols()) {
             auto flags = sym.getFlags();
             auto name = sym.getName();
-            if (!flags || !name || !(*flags & llvm::object::SymbolRef::SF_Weak) || (*flags & llvm::object::SymbolRef::SF_Undefined)) {
+            // (COFF: a weak definition is an undefined "weak external" with a default)
+            bool undef = flags && (*flags & llvm::object::SymbolRef::SF_Undefined) && !(*file)->isCOFF();
+            if (!flags || !name || !(*flags & llvm::object::SymbolRef::SF_Weak) || undef) {
                 if (!flags) llvm::consumeError(flags.takeError());
                 if (!name) llvm::consumeError(name.takeError());
                 continue;
@@ -285,7 +438,7 @@ static int load(const std::string &srcDir)
             llvm::StringRef plain = *name;
             char prefix = J.getDataLayout().getGlobalPrefix();
             if (prefix && plain.starts_with(llvm::StringRef(&prefix, 1))) plain = plain.drop_front();
-            if (void *addr = dlsym(RTLD_DEFAULT, plain.str().c_str()))
+            if (void *addr = hostSymbol(plain.str().c_str()))
                 natives[J.getExecutionSession().intern(*name)] = {llvm::orc::ExecutorAddr::fromPtr(addr), llvm::JITSymbolFlags::Exported};
         }
     }

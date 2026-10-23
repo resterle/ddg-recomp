@@ -1,7 +1,7 @@
 # Builds the shareable programs (RECOMP_JIT: no game code; the program translates the player's
-# perfect.exe and compiles it on the first start) for Linux x86-64 and macOS (Apple Silicon), and
-# publishes them as a GitHub release for a version tag (v*). Started by hand (Actions tab), it only
-# builds: the packages are the run's artifacts.
+# perfect.exe and compiles it on the first start) for Linux x86-64, Windows x86-64 and macOS
+# (Apple Silicon), and publishes them as a GitHub release for a version tag (v*). Started by hand
+# (Actions tab), it only builds: the packages are the run's artifacts.
 #
 # Only these programs may be published: the other builds (docker-build.sh, the builder kit, the
 # handheld package) contain code translated from perfect.exe.
@@ -56,9 +56,28 @@ jobs:
           path: recomp/build/ddg-recomp-macos-arm64.zip
           if-no-files-found: error
 
+  windows-x64:
+    runs-on: ubuntu-22.04                 # cross-built (recomp/windows/build-release.sh)
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: recomp/build/release-cache-win
+          key: release-windows-x64-${{ hashFiles('recomp/windows/build-release.sh') }}
+      - name: Build
+        run: sh recomp/windows/build-release.sh
+        env:
+          XWIN_ACCEPT_LICENSE: '1'        # Microsoft's licence for the C runtime and Windows SDK
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ddg-recomp-windows-x64
+          path: recomp/build/ddg-recomp-windows-x64.zip
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: [linux-x64, macos-arm64]
+    needs: [linux-x64, windows-x64, macos-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -74,11 +93,13 @@ jobs:
           your own copy (the cddata folder and an unprotected perfect.exe). On the first start the
           program translates perfect.exe and compiles it for your computer (one to two minutes).
 
+          - Windows 10 or newer (64-bit): unpack ddg-recomp-windows-x64.zip, run ddg-recomp\perfect_recomp.exe;
+            it is not signed, so Windows may ask: More info > Run anyway.
           - Linux x86-64 (glibc 2.35 or newer): unpack ddg-recomp-linux-x64.tar.xz, run ddg-recomp/perfect_recomp.
           - macOS (Apple Silicon, macOS 14 or newer): unpack the zip; the app is not notarised, so open it
             the first time with right-click > Open.
 
-          The game code made on your computer is kept in ~/.cache/ddg-recomp (macOS ~/Library/Caches/ddg-recomp):
-          do not share it. Licences and the source commit are inside each package (GPL-3.0).
+          The game code made on your computer is kept in ~/.cache/ddg-recomp (macOS ~/Library/Caches/ddg-recomp,
+          Windows %LOCALAPPDATA%\ddg-recomp): do not share it. Licences and the source commit are inside each package (GPL-3.0).
           EOF
           )"

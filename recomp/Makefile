@@ -34,7 +34,8 @@ DEFS       := -DRT_MEM_BASE=$(MEMBASE)
 # headers (host/os_win.c implements them).
 WIN        := $(if $(or $(findstring mingw,$(shell $(CC) -dumpmachine)),$(findstring windows,$(shell $(CC) -dumpmachine))),1,)
 ifeq ($(WIN),1)
-DEFS       += -Ihost/win/include
+WIN_INC    := -Ihost/win/include
+DEFS       += $(WIN_INC)
 SDL_LIBS   := $(SDL_PREFIX)/lib/libSDL3.dll.a
 WIN_LIBS   := -lwinmm
 EXE        := .exe
@@ -71,7 +72,16 @@ PY_PREFIX  ?= build/kit-cache/unpacked/pbs-full/python
 CAPSTONE_WHEEL ?= $(firstword $(wildcard build/kit-cache/capstone-linux-x64/*.whl))
 DEFS       += -DRECOMP_JIT
 GAME_OBJ   :=
-HOST_OBJ   += $(OBJ)/host/jit.o $(OBJ)/host/rt_header.o $(OBJ)/host/pyembed.o $(OBJ)/py/pyconfig.o
+HOST_OBJ   += $(OBJ)/host/jit.o $(OBJ)/host/rt_header.o $(OBJ)/host/pyembed.o
+# the Python that runs host/mkpyruntime.py (Windows: any Python 3; the distribution is only read)
+ifeq ($(WIN),1)
+PY_INC     := $(PY_PREFIX)/install/include
+PY_RUN     ?= python3
+else
+PY_INC     := $(PY_PREFIX)/install/include/python3.12
+PY_RUN     ?= $(PY_PREFIX)/install/bin/python3
+HOST_OBJ   += $(OBJ)/py/pyconfig.o
+endif
 # libpython and what it needs: $(OBJ)/py/link.txt (host/mkpyruntime.py), read when linking
 PY_LIBS    = $$(cat $(OBJ)/py/link.txt)
 LLVM_SYSLIBS ?=
@@ -84,7 +94,14 @@ JIT_CXXFLAGS := -I$(LLVM_PREFIX)/include -std=c++17 -D_GNU_SOURCE -D__STDC_CONST
 # needs besides (llvm-config --link-static --system-libs, e.g. -lz -lzstd)
 # (libPolly*: Homebrew's and apt.llvm.org's LLVM are built with Polly, which the pass builder calls)
 LLVM_ARCHIVES := $(filter-out %/libclang.a,$(wildcard $(LLVM_PREFIX)/lib/libclang*.a $(LLVM_PREFIX)/lib/libLLVM*.a $(LLVM_PREFIX)/lib/libPolly*.a))
-ifeq ($(shell uname -s),Darwin)
+ifeq ($(WIN),1)
+# Windows (x86_64-pc-windows-msvc): LLVM's own release, built with the static C runtime (/MT);
+# lld-link searches the libraries in any order. The runtime's interface is exported by a .def
+# (host/jit.cpp finds it with GetProcAddress).
+LLVM_ARCHIVES := $(filter-out %/libclang.lib %/LLVM-C.lib,$(wildcard $(LLVM_PREFIX)/lib/clang*.lib $(LLVM_PREFIX)/lib/LLVM*.lib))
+JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,/def:$(OBJ)/jit-exports.def -Wl,/opt:ref
+JIT_DEF    := $(OBJ)/jit-exports.def
+else ifeq ($(shell uname -s),Darwin)
 JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,-exported_symbols_list,host/jit-exports-macos.txt -Wl,-dead_strip -Wl,-dead_strip_dylibs -lpthread -lm
 else
 JIT_EXPORTS := -Wl,--export-dynamic-symbol=N_* -Wl,--export-dynamic-symbol=R -Wl,--export-dynamic-symbol=RT_* -Wl,--export-dynamic-symbol=rt_*
@@ -97,9 +114,14 @@ endif
 endif
 PORT_OBJ := $(patsubst %,$(OBJ)/port/%.o,$(PORT_SRC))
 
-$(TARGET): $(GAME_OBJ) $(HOST_OBJ) $(PORT_OBJ) $(if $(filter 1,$(RECOMP_JIT)),$(OBJ)/py/link.txt)
+$(TARGET): $(GAME_OBJ) $(HOST_OBJ) $(PORT_OBJ) $(if $(filter 1,$(RECOMP_JIT)),$(OBJ)/py/link.txt) $(JIT_DEF)
 	@mkdir -p $(dir $@)
 	$(CXX) $(PGOFLAGS) $(TUNE) $(LTOFLAGS) -o $@ $(filter %.o,$^) $(SDL_LIBS) $(JIT_LIBS) $(WIN_LIBS) $(LDEXTRA)
+
+# the runtime's interface (what the translated code calls), exported for the JIT (Windows)
+NM         ?= llvm-nm
+$(OBJ)/jit-exports.def: $(HOST_OBJ) $(PORT_OBJ)
+	(echo EXPORTS; $(NM) -g --defined-only $(filter %.o,$^) | awk '$$3 ~ /^(N_|RT_|rt_)/ || $$3 == "R" {print $$3}' | sort -u) > $@
 
 $(OBJ)/game/%.o: build/game/%.c recomp_rt.h
 	@mkdir -p $(dir $@)
@@ -127,11 +149,11 @@ $(OBJ)/host/dsound.o: host/dsound.cpp host/runtime.h recomp_rt.h
 
 $(OBJ)/host/launcher.o: host/launcher.cpp host/launcher.h
 	@mkdir -p $(dir $@)
-	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -Wall -MMD -MP $(SDL_CFLAGS) -c $< -o $@
+	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -Wall -MMD -MP $(WIN_INC) $(SDL_CFLAGS) -c $< -o $@
 
 $(OBJ)/host/overlay.o: host/overlay.cpp host/overlay.h host/launcher.h
 	@mkdir -p $(dir $@)
-	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -Wall -MMD -MP $(SDL_CFLAGS) -c $< -o $@
+	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -Wall -MMD -MP $(WIN_INC) $(SDL_CFLAGS) -c $< -o $@
 
 $(OBJ)/host/jit.o: host/jit.cpp recomp_rt.h
 	@mkdir -p $(dir $@)
@@ -148,7 +170,7 @@ $(OBJ)/host/rt_header.o: $(OBJ)/host/rt_header.c
 # the translator runtime (stdlib subset, translator, capstone) and Python's module table; one run
 # writes all three (the others hang off runtime.bin: make 3.81 has no grouped targets)
 $(OBJ)/py/runtime.bin: host/mkpyruntime.py $(wildcard *.py data/*) build/discovered.txt
-	$(PY_PREFIX)/install/bin/python3 host/mkpyruntime.py $(PY_PREFIX) $(CAPSTONE_WHEEL) $(OBJ)/py
+	$(PY_RUN) host/mkpyruntime.py $(PY_PREFIX) $(CAPSTONE_WHEEL) $(OBJ)/py
 
 $(OBJ)/py/pyconfig.c $(OBJ)/py/link.txt: $(OBJ)/py/runtime.bin
 	@:
@@ -158,11 +180,11 @@ $(OBJ)/py/pyconfig.o: $(OBJ)/py/pyconfig.c
 
 $(OBJ)/host/pyembed.o: host/pyembed.cpp $(OBJ)/py/runtime.bin
 	@mkdir -p $(dir $@)
-	$(CXX) $(TUNE) -std=c++17 -O2 -g -Wall -I$(PY_PREFIX)/install/include/python3.12 -DRT_PY_RUNTIME='"$(abspath $(OBJ)/py/runtime.bin)"' -c $< -o $@
+	$(CXX) $(TUNE) -std=c++17 -O2 -g -Wall $(WIN_INC) -I$(PY_INC) -DRT_PY_RUNTIME='"$(abspath $(OBJ)/py/runtime.bin)"' -c $< -o $@
 
 $(OBJ)/port/%.o: ../port/src/unb/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -w -MMD -MP $(SDL_CFLAGS) -c $< -o $@
+	$(CXX) $(PGOFLAGS) $(TUNE) -std=c++17 -O2 -g -w -MMD -MP $(WIN_INC) $(SDL_CFLAGS) -c $< -o $@
 
 # header dependencies (generated by -MMD)
 -include $(GAME_OBJ:.o=.d) $(HOST_OBJ:.o=.d) $(PORT_OBJ:.o=.d)

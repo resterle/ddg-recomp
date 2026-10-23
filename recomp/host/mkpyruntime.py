@@ -14,6 +14,10 @@ it finds are the ones of the libpython the program links. Writes to <out dir>:
                 stdlib.zip (the pure Python modules the translator imports), the translator
                 (recomp/*.py and the data it reads) and capstone (its Python package and
                 libcapstone.so); pyembed.cpp unpacks them into the cache on the first start
+
+A Windows distribution (install/python.exe) is read rather than run, so any Python 3 on the build
+machine does: the program links python312.dll (link.txt names its import library; there is no
+pyconfig.c) and runtime.bin also carries the extension modules (.pyd) the translator imports.
 """
 import io, json, modulefinder, os, re, struct, sys, zipfile
 
@@ -36,12 +40,15 @@ USED = {'_abc', '_ast', '_bisect', '_bz2', '_codecs', '_collections', '_ctypes',
         '_locale', '_lzma', '_opcode', '_operator', '_posixsubprocess', '_random', '_sha2', '_signal', '_sre',
         '_stat', '_struct', '_tokenize', '_typing', 'binascii', 'errno', 'fcntl', 'itertools', 'marshal', 'math',
         'posix', 'select', 'time', 'zlib'}
+# Windows: USED's modules that are not in python312.dll, and what they load
+WIN_DLLS = ['_bz2.pyd', '_ctypes.pyd', '_lzma.pyd', 'select.pyd', 'libffi-8.dll']
 # what runs the translator (pyembed.cpp) on top of what build_game.py imports
 DRIVER = 'import runpy, sys, os\n'
 
 
 def main():
     pbs, wheel, out = sys.argv[1:]
+    windows = os.path.exists(os.path.join(pbs, 'install', 'python.exe'))
     os.makedirs(out, exist_ok=True)
     pylib = os.path.join(out, 'pylib')
     with zipfile.ZipFile(wheel) as z:
@@ -50,12 +57,13 @@ def main():
     # the modules: modulefinder over the translator and the driver (finds conditional imports too)
     driver = os.path.join(out, 'driver.py')
     open(driver, 'w').write(DRIVER + 'import build_game\n')
-    mf = modulefinder.ModuleFinder(path=[RECOMP, pylib] + sys.path[1:])
+    stdroot = os.path.join(pbs, 'install', 'Lib') if windows else os.path.dirname(os.__file__)
+    mf = modulefinder.ModuleFinder(path=[RECOMP, pylib] + ([stdroot] if windows else sys.path[1:]))
     mf.run_script(driver)
-    builtin_avail = set(sys.builtin_module_names)
+    # (Windows: the built-in modules are python312.dll's; the ones found here have no file)
+    builtin_avail = set() if windows else set(sys.builtin_module_names)
     builtins = BOOTSTRAP | USED
     stdlib = {}
-    stdroot = os.path.dirname(os.__file__)
     for name, mod in mf.modules.items():
         f = getattr(mod, '__file__', None)
         if name in builtin_avail:
@@ -68,6 +76,9 @@ def main():
     for f in os.listdir(stdroot):                                       # sysconfig reads this by name
         if f.startswith('_sysconfigdata_') and f.endswith('.py'):
             stdlib[f] = os.path.join(stdroot, f)
+
+    if windows:
+        return finish(windows, pbs, out, pylib, stdlib, [], [os.path.join(pbs, 'install', 'libs', 'python312.lib')])
 
     # the module table: the distribution's config.c with the other modules left out
     src = open(os.path.join(pbs, 'build', 'Modules', 'config.c')).read()
@@ -100,6 +111,10 @@ def main():
             continue
         if f[-1] not in flags:
             flags += f
+    finish(windows, pbs, out, pylib, stdlib, keep, flags)
+
+
+def finish(windows, pbs, out, pylib, stdlib, keep, flags):
     open(os.path.join(out, 'link.txt'), 'w').write(' '.join(flags) + '\n')
 
     # the archive
@@ -113,9 +128,12 @@ def main():
         records.append(('translator/' + f, open(os.path.join(RECOMP, f), 'rb').read()))
     for d, _, files in os.walk(os.path.join(pylib, 'capstone')):
         for f in files:
-            if f.endswith(('.py', '.so', '.dylib')) or '.so.' in f:     # the library: .so, macOS .dylib
+            if f.endswith(('.py', '.so', '.dylib', '.dll')) or '.so.' in f:     # the library: .so, .dylib, .dll
                 p = os.path.join(d, f)
                 records.append(('pylib/' + os.path.relpath(p, pylib).replace(os.sep, '/'), open(p, 'rb').read()))
+    if windows:
+        for f in WIN_DLLS:
+            records.append(('DLLs/' + f, open(os.path.join(pbs, 'install', 'DLLs', f), 'rb').read()))
     with open(os.path.join(out, 'runtime.bin'), 'wb') as f:
         for name, data in records:
             n = name.encode()

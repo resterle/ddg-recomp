@@ -3,9 +3,10 @@
 **ddg-recomp** is a native port of the PC version of *Densha de GO! FINAL* (TAITO, 2004), made
 by **static recompilation**: every x86 function of the game's executable is translated into C,
 the Windows and Direct3D 8 parts are replaced with new code on SDL3, and the result is compiled
-for the target machine. The game runs without Windows, Wine or an emulator on:
+for the target machine. The game runs natively, without Wine or an emulator, on:
 
 - **Linux desktop** (x86-64): SDL GPU on Vulkan, or OpenGL 3.3
+- **Windows** (x86-64): SDL GPU on Vulkan (new; tested under wine so far)
 - **Linux ARM handhelds** with ArkOS-style firmware (R36H, R36S and other RK3326 devices):
   OpenGL ES 3.0 on the Mali-G31, packaged as a PortMaster-style port
 - **macOS** (Apple Silicon): SDL GPU on Metal
@@ -17,6 +18,34 @@ translated game code is generated on your machine from your own executable (see
 > **AI-generated:** most of the code and documentation in this project was written by an AI
 > (Anthropic's Claude, through Claude Code), directed and tested on real hardware by the author.
 > Expect the strengths and weaknesses that come with that; bug reports and reviews are welcome.
+
+## Quick start: I just want to play
+
+You don't need to build anything or know how any of this works.
+
+1. **Have the game.** You need the PC version of *Densha de GO! FINAL* installed somewhere: the
+   folder with `cddata` in it, and a `perfect.exe` that is **not** the one from the CD (that one
+   is copy-protected and won't work). A `perfect.exe` patched with
+   [DDGModernizer](https://github.com/hunterbridges/DDGModernizer) is fine.
+2. **Download the program** for your computer from the
+   [releases page](https://github.com/resterle/ddg-recomp/releases/latest):
+   - **Linux** (x86-64): `ddg-recomp-linux-x64.tar.xz`. Unpack it and run `ddg-recomp/perfect_recomp`.
+   - **macOS** (Apple Silicon): `ddg-recomp-macos-arm64.zip`. Unpack it, then right-click the app
+     and choose **Open** the first time (it isn't signed by Apple).
+   - **Windows** (10 or newer, 64-bit): `ddg-recomp-windows-x64.zip`. Unpack it and run
+     `ddg-recomp\perfect_recomp.exe`. Windows may warn about an unknown publisher (it isn't
+     signed): click **More info**, then **Run anyway**.
+3. **Point it at your game.** A settings window opens. Choose your game folder (and `perfect.exe`,
+   if it's somewhere else). The first time, the program gets the game ready for your computer.
+   This takes one to two minutes. Meanwhile you can pick the resolution and the other options.
+4. **Press Start and drive.** Later starts go straight into the game.
+
+Controls: arrow keys or a gamepad. ←/→ release and apply the brake while driving, Return
+confirms, Escape goes back. F10 (Y on a gamepad) opens the options menu while playing. The full
+list is under [Controls](#controls).
+
+The program downloads nothing and contains no part of the game. It works only with your own
+copy.
 
 ## Status
 
@@ -49,14 +78,16 @@ The recompiled code is generated from your `perfect.exe`, and the game checks at
 runs with the same exe (it reads the game's tables and texts from it). Other versions, or an exe
 with a translation patch, need their own build.
 
-## Ready-made programs (Linux, macOS)
+## Ready-made programs (Linux, Windows, macOS)
 
 The [releases](https://github.com/resterle/ddg-recomp/releases) have programs that contain no part
 of the game: on the first start they translate your `perfect.exe` and compile it for your
 computer with a built-in translator and compiler (one to two minutes, once; a settings window
 shows the progress, and you can choose the game folder, the exe and the settings meanwhile).
 They are built by `.github/workflows/release.yml` (`make RECOMP_JIT=1`, see
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) §3l). Linux x86-64 needs glibc 2.35 or newer; the
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) §3l). Linux x86-64 needs glibc 2.35 or newer. The
+Windows build (x86-64, Windows 10 or newer, Vulkan) is made on Linux
+(`recomp/windows/build-release.sh`, §3m) and tested under wine, not yet on a Windows PC. The
 macOS build (Apple Silicon) is new and not yet tested on a Mac. The ARM handhelds still need one
 of the builds below.
 

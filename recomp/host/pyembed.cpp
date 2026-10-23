@@ -21,6 +21,9 @@ extern "C" const char rt_py_runtime[], rt_py_runtime_end[];
 #ifdef __APPLE__
 __asm__(".section __DATA,__const\n.p2align 4\n.globl _rt_py_runtime\n_rt_py_runtime:\n.incbin \"" RT_PY_RUNTIME "\"\n"
         ".globl _rt_py_runtime_end\n_rt_py_runtime_end:\n.byte 0\n.text\n");
+#elif defined(_WIN32)
+__asm__(".section .rdata,\"dr\"\n.balign 16\n.globl rt_py_runtime\nrt_py_runtime:\n.incbin \"" RT_PY_RUNTIME "\"\n"
+        ".globl rt_py_runtime_end\nrt_py_runtime_end:\n.byte 0\n.text\n");
 #else
 __asm__(".section .rodata\n.balign 16\n.global rt_py_runtime\nrt_py_runtime:\n.incbin \"" RT_PY_RUNTIME "\"\n"
         ".global rt_py_runtime_end\nrt_py_runtime_end:\n.byte 0\n.text\n");
@@ -40,9 +43,17 @@ static void mkdirs(const std::string &path)
 
 static bool exists(const std::string &p) { struct stat st; return stat(p.c_str(), &st) == 0; }
 
-// ~/.cache/ddg-recomp ($XDG_CACHE_HOME); macOS: ~/Library/Caches/ddg-recomp
+// ~/.cache/ddg-recomp ($XDG_CACHE_HOME); macOS: ~/Library/Caches/ddg-recomp; Windows:
+// %LOCALAPPDATA%/ddg-recomp
 std::string rt_cache_dir()
 {
+#ifdef _WIN32
+    const char *local = getenv("LOCALAPPDATA");
+    std::string dir = local && *local ? local : ".";
+    for (char &c : dir)
+        if (c == '\\') c = '/';
+    return dir + "/ddg-recomp";
+#endif
     const char *xdg = getenv("XDG_CACHE_HOME");
     const char *home = getenv("HOME");
     std::string h = home ? home : "/tmp";
@@ -84,7 +95,8 @@ static bool unpackRuntime(const std::string &dir)
 
 static void setPath(PyConfig &cfg, const std::string &dir)
 {
-    for (const char *sub : {"/stdlib.zip", "/translator", "/pylib"}) {
+    // (Windows: the extension modules, .pyd, are in DLLs/; Python itself is python312.dll)
+    for (const char *sub : {"/stdlib.zip", "/translator", "/pylib", "/DLLs"}) {
         wchar_t *w = Py_DecodeLocale((dir + sub).c_str(), nullptr);
         PyWideStringList_Append(&cfg.module_search_paths, w);
         PyMem_RawFree(w);

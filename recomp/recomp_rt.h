@@ -22,13 +22,25 @@ typedef struct CPU {
     uint32_t cw;            // x87 control word
 } CPU;
 
-extern CPU R;
+// C linkage in C++ too (the MSVC ABI decorates C++ variable names)
+#ifdef __cplusplus
+#define RT_EXTERN_C extern "C"
+#else
+#define RT_EXTERN_C extern
+#endif
+// RT_HOST_DATA: how the translated code reaches the runtime's data. The Windows JIT (host/jit.cpp)
+// makes it dllimport: its linker routes every reference to another object's symbol
+// through a call stub, which is right for functions only.
+#ifndef RT_HOST_DATA
+#define RT_HOST_DATA
+#endif
+RT_EXTERN_C RT_HOST_DATA CPU R;
 #ifdef RT_MEM_BASE
 // The emulated 4 GB live at a fixed address chosen at build time: every access compiles to a
 // constant base plus offset (a global pointer had to be reloaded after every store).
 #define MEM ((uint8_t *)(uintptr_t)(RT_MEM_BASE))
 #else
-extern uint8_t *MEM;
+RT_EXTERN_C uint8_t *MEM;
 #endif
 
 typedef void (*RecompFn)(void);
@@ -46,7 +58,7 @@ typedef int64_t RtAddr;
 
 // Registers live in locals inside a translated function; these move them to/from R.
 #ifdef RT_COUNT_SAVES
-extern uint64_t RT_SAVES;
+RT_EXTERN_C uint64_t RT_SAVES;
 #define RT_COUNT_SAVE() (RT_SAVES++)
 #else
 #define RT_COUNT_SAVE() ((void)0)
@@ -104,7 +116,7 @@ int rt_skip(uint32_t addr);         // LIFT_SKIPPABLE functions: switched off no
 
 // Test builds record which 4 KB pages were written (verify.py compares only those).
 #ifdef RT_TRACK_WRITES
-extern uint8_t RT_DIRTY[1u << 20];
+RT_EXTERN_C uint8_t RT_DIRTY[1u << 20];
 #define RT_MARK(a, n) (RT_DIRTY[(uint32_t)(a) >> 12] = 1, RT_DIRTY[(uint32_t)((a) + (n) - 1) >> 12] = 1)
 #else
 #define RT_MARK(a, n) ((void)0)

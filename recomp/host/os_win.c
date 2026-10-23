@@ -251,9 +251,76 @@ void rt_win_install_crash_handler(void (*report)(unsigned code, void *pc, void *
     SetThreadStackGuarantee(&guarantee);
 }
 
-// Process setup: 1 ms timer resolution (condition variable timeouts, Sleep), UTF-8 console output.
+// Process setup: 1 ms timer resolution (condition variable timeouts, Sleep), UTF-8 console output,
+// stderr unbuffered also into a pipe or file (the C library buffers it there: lost on a crash).
 void rt_win_init(void)
 {
+    setvbuf(stderr, NULL, _IONBF, 0);
     timeBeginPeriod(1);
     SetConsoleOutputCP(CP_UTF8);
+}
+
+// --- RECOMP_JIT (host/jit.cpp) ---------------------------------------------------------------
+
+// The program's own exported symbol (the runtime's interface, exported by the .def the Makefile
+// writes), or NULL.
+void *rt_win_exe_symbol(const char *name)
+{
+    return (void *)GetProcAddress(GetModuleHandleA(NULL), name);
+}
+
+// Address space for the compiled game code within 2 GB of the program: the code calls the
+// runtime and reads its data with 32-bit pc-relative addresses (the small code model), and the
+// unwind tables are 32-bit offsets from a base. Reserved once, committed as handed out.
+static uint8_t *g_jit_base, *g_jit_next, *g_jit_end;
+static SRWLOCK g_jit_lock = SRWLOCK_INIT;
+
+static int jit_reserve(size_t size)
+{
+    HMODULE exe = GetModuleHandleA(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)exe + ((IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
+    const uintptr_t step = 64u << 20;
+    // after the program first, then before it; every byte of it within 2 GB of every byte of the program
+    for (int dir = 0; dir < 2; dir++)
+        for (uintptr_t i = 1; i < 32; i++) {
+            uintptr_t a = dir == 0 ? ((hi + step - 1) & ~(step - 1)) + (i - 1) * step : (lo & ~(step - 1)) - i * step - size;
+            if (dir == 0 ? a + size - lo > (1ull << 31) - (1u << 20) : hi - a > (1ull << 31) - (1u << 20)) break;
+            void *p = VirtualAlloc((void *)a, size, MEM_RESERVE, PAGE_NOACCESS);
+            if (p) { g_jit_base = g_jit_next = (uint8_t *)p; g_jit_end = g_jit_base + size; return 1; }
+        }
+    return 0;
+}
+
+// size bytes of read/write memory (64 KB aligned) near the program, or NULL.
+void *rt_win_jit_alloc(size_t size)
+{
+    AcquireSRWLockExclusive(&g_jit_lock);
+    if (!g_jit_base && !jit_reserve(1u << 30)) jit_reserve(256u << 20);
+    size = (size + 0xffff) & ~(size_t)0xffff;
+    void *p = NULL;
+    if (g_jit_base && size <= (size_t)(g_jit_end - g_jit_next)) {
+        p = VirtualAlloc(g_jit_next, size, MEM_COMMIT, PAGE_READWRITE);
+        if (p) g_jit_next += size;
+    }
+    ReleaseSRWLockExclusive(&g_jit_lock);
+    return p;
+}
+
+// prot: 1 read, 2 write, 4 execute (llvm::sys::Memory's flags)
+int rt_win_jit_protect(void *p, size_t size, unsigned prot)
+{
+    DWORD f = (prot & 4) ? ((prot & 2) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ)
+                         : ((prot & 2) ? PAGE_READWRITE : (prot & 1) ? PAGE_READONLY : PAGE_NOACCESS);
+    DWORD old;
+    if (!VirtualProtect(p, size, f, &old)) return -1;
+    if (prot & 4) FlushInstructionCache(GetCurrentProcess(), p, size);
+    return 0;
+}
+
+// The unwind table (.pdata) of one compiled object, for exceptions and longjmp across its
+// functions (runtime.c's thread exit). base: what its entries are relative to.
+int rt_win_jit_unwind(void *pdata, size_t size, uint64_t base)
+{
+    return RtlAddFunctionTable((PRUNTIME_FUNCTION)pdata, (DWORD)(size / sizeof(RUNTIME_FUNCTION)), base) ? 0 : -1;
 }

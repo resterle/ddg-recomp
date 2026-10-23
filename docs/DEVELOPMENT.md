@@ -87,7 +87,7 @@ player's aspect and draw distance then replace the neutral values (below).
 | `recomp/verify.py`, `gen.py`, `rt_test.c` | Differential tester (Unicorn vs translated C) |
 | `recomp/host/runtime.c` | Memory, PE loader, dispatch, threads/GIL, heap, path mapping |
 | `recomp/host/win32.c` | Win32 API shim |
-| `recomp/host/os_win.c`, `host/win/include/` | Windows builds: the POSIX subset the runtime uses, emulated memory, fibers, crash report (§3m); `recomp/windows/build-cross.sh` |
+| `recomp/host/os_win.c`, `host/win/include/` | Windows builds: the POSIX subset the runtime uses, emulated memory, fibers, crash report, the JIT's memory (§3m); `recomp/windows/build-cross.sh` (with the game code), `build-release.sh` (the shareable program) |
 | `recomp/host/native.cpp` | Natives (WinMain, message loop, DMA send, textures, models, input, movie) + test hooks |
 | `recomp/iterate.sh` | Run → on "unknown address" trap regenerate/rebuild → repeat |
 | `recomp/tools/` | Scripted-run helpers (`nav.sh`, `drive_keys.sh`), screenshot tools (`magcount.py`, `montage.py`), `histo.py` (instruction histogram); see §6 |
@@ -898,9 +898,43 @@ os_win.c is the only file with `<windows.h>` (its names collide with the Win32 s
 Under wine 11 (Vulkan via the host's RADV) the Osaka loop drive runs at 60 ticks/s, game code
 1.5 ms/tick as on Linux (the Windows x64 calling convention returns the translated functions'
 16-byte RtRet in memory, which costs nothing measurable), render 4 ms/tick against 3.6 natively.
-The settings window, sound (WASAPI) and saves work. Not yet tried on a real Windows PC. Still
-open: the shareable RECOMP_JIT program for Windows (MSVC ABI, COFF in the JIT) and a release job;
-the console window (stderr) and UTF-8 paths (an application manifest with `activeCodePage`).
+The settings window, sound (WASAPI) and saves work. Not yet tried on a real Windows PC.
+
+**The shareable program (RECOMP_JIT, 3l)**: `recomp/windows/build-release.sh` builds
+`build/ddg-recomp-windows-x64.zip` on Linux (the release workflow's `windows-x64` job runs it on
+Ubuntu). It targets x86_64-pc-windows-msvc, the ABI of LLVM's and python-build-standalone's
+Windows releases: llvm-mingw's clang and lld-link against the MSVC C runtime and Windows SDK that
+[xwin](https://github.com/Jake-Shadle/xwin) downloads (`XWIN_ACCEPT_LICENSE=1` accepts
+Microsoft's licence for them), with the static C runtime (`/MT`) as LLVM's libraries are built.
+
+- LLVM's release has no zlib/zstd, which its libraries use: the script builds both. Python is
+  `python312.dll` (pbs has no static Windows build); runtime.bin also carries the four extension
+  modules the translator needs (`_bz2`, `_ctypes` with libffi, `_lzma`, `select`), unpacked into
+  `DLLs/` of the cache. mkpyruntime.py reads a Windows distribution with any Python (it is not run).
+- The program's interface for the game code is exported by a .def (Makefile, from llvm-nm over
+  the host objects; `GetProcAddress` replaces dlsym). The C library is linked in statically and
+  not exported, so jit.cpp hands the game code its functions from a table (memcpy, the maths,
+  `__chkstk`, ...).
+- LLJIT uses RuntimeDyld for COFF, which sends every reference to another object's symbol
+  through a call stub, data too: a store to `R` landed in a stub. The JIT compiles with
+  `RT_HOST_DATA=dllimport` (recomp_rt.h), so `R` is reached through its address. The code is
+  placed within 2 GB of the program (os_win.c `rt_win_jit_alloc`: pc-relative calls to it) and
+  compiled with `-funwind-tables=2`; each object's `.pdata` is registered with
+  `RtlAddFunctionTable` (relative to its lowest section, as RuntimeDyld resolves them), so that
+  `longjmp` (guest thread exit) and the exception dispatcher can unwind across it. Without unwind
+  tables the first access fault in the game code ended in a stack overflow inside ntdll's unwinder.
+- The main thread gets 16 MB of stack (`/stack`; 1 MB by default): with `--play` the translator
+  and clang run on it. The virtual folder of the built-in headers needs a drive (`C:/ddg-include`).
+  An application manifest (as a resource: lld-link would need mt.exe to merge one) sets UTF-8 as
+  the process code page, so paths with any characters work. stderr is unbuffered (the C library
+  buffers it into pipes and files, which lost the output of a crash). The game code is cached in
+  `%LOCALAPPDATA%\ddg-recomp`. `RECOMP_JIT_TRACE=1` prints where each section went.
+
+Under wine: the first start (settings window, empty cache) translated and compiled in 30 s on
+16 threads, later starts load in 0.2 s; the Osaka loop drive reached Driver Mode at 60 ticks/s,
+game code 1.9 ms/tick (1.5 with the normal build's ThinLTO across files), render 4.2. The package
+(41 MB zipped): perfect_recomp.exe, SDL3.dll, python312.dll, vcruntime140(_1).dll. Still open: the
+console window (stderr) and a test on a real Windows PC.
 
 ## 4. How the recompiler works (essentials)
 
