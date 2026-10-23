@@ -16,12 +16,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 #include <setjmp.h>
+#ifdef _WIN32
+// host/os_win.c
+void *rt_win_fiber_create(void (*fn)(void *), void *arg, size_t stack);
+void rt_win_fiber_switch(void **self, void *to);
+void rt_win_fiber_delete(void *f);
+void rt_win_commit(void *p, size_t n);
+void rt_win_install_crash_handler(void (*report)(unsigned code, void *pc, void *addr));
+#else
+#include <sys/mman.h>
 #include <signal.h>
 #include <execinfo.h>
 #include <dlfcn.h>
@@ -29,6 +37,7 @@
 #include <sys/ucontext.h>
 #else
 #include <ucontext.h>
+#endif
 #endif
 
 CPU R;
@@ -87,7 +96,7 @@ struct RtThread {
     struct RtThread *next;
     // fibers (rt_fiber_create): guest threads without a host thread of their own
     int fiber;
-    void *sp;                       // saved host stack pointer while switched out
+    void *sp;                       // saved host stack pointer while switched out (Windows: the fiber)
     void *hostStack;                // host stack mapping and its size
     size_t hostStackSize;
     void (*fiberFn)(void *);
@@ -326,7 +335,9 @@ uint64_t rt_thread_cpu_ns(uint32_t handle)
 
 // rt_ctx_switch(&from->sp, to->sp): saves the callee-saved registers and the FP control state
 // on the current stack, stores the stack pointer, loads the other one and restores from it.
-#if defined(__x86_64__)
+// Windows uses its own fibers instead (host/os_win.c).
+#if defined(_WIN32)
+#elif defined(__x86_64__)
 #  ifdef __APPLE__
 #    define RT_SYM(x) "_" #x
 #  else
@@ -359,7 +370,9 @@ __asm__(".text\n.globl " RT_SYM(rt_ctx_switch) "\n.p2align 2\n" RT_SYM(rt_ctx_sw
 #else
 #  error "rt_ctx_switch: add the context switch for this architecture"
 #endif
+#ifndef _WIN32
 void rt_ctx_switch(void **from, void *to);
+#endif
 
 static uint64_t now_ns(void)
 {
@@ -376,6 +389,9 @@ static void fiber_entry(void)
         t->fiberFn(t->fiberArg);
     RT_Fatal("fiber function returned", t->tid);    // fibers end by switching away for good
 }
+#ifdef _WIN32
+static void fiber_start(void *arg) { (void)arg; fiber_entry(); }
+#endif
 
 RtThread *rt_fiber_create(void (*fn)(void *), void *arg)
 {
@@ -385,6 +401,10 @@ RtThread *rt_fiber_create(void (*fn)(void *), void *arg)
     t->fiberArg = arg;
     t->handle = rt_handle_new(H_THREAD, t);
     t->hostStackSize = 8u << 20;                    // like the guest threads' host stacks
+#ifdef _WIN32
+    t->sp = rt_win_fiber_create(fiber_start, t, t->hostStackSize);
+    if (!t->sp) RT_Fatal("cannot create a fiber", t->tid);
+#else
     t->hostStack = mmap(NULL, t->hostStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (t->hostStack == MAP_FAILED) RT_Fatal("cannot allocate a fiber stack", t->tid);
     mprotect(t->hostStack, 4096, PROT_NONE);       // guard page
@@ -410,6 +430,7 @@ RtThread *rt_fiber_create(void (*fn)(void *), void *arg)
     p[20] = fpcr;
     t->sp = p;
 #endif
+#endif
     return t;
 }
 
@@ -425,7 +446,11 @@ void rt_fiber_switch(RtThread *to)
     save_state();
     t_self = to;
     restore_state();
+#ifdef _WIN32
+    rt_win_fiber_switch(&self->sp, to->sp);
+#else
     rt_ctx_switch(&self->sp, to->sp);
+#endif
 }
 
 // Releases a fiber that is not running: its host stack, its guest stack (reused) and its
@@ -434,8 +459,13 @@ void rt_fiber_destroy(RtThread *t)
 {
     if (!t || !t->fiber || t == t_self || t->finished) return;
     t->finished = 1;
+#ifdef _WIN32
+    rt_win_fiber_delete(t->sp);
+    t->sp = NULL;
+#else
     munmap(t->hostStack, t->hostStackSize);
     t->hostStack = NULL;
+#endif
     if (g_nFreeStacks < (int)(sizeof(g_freeStacks) / sizeof(g_freeStacks[0])))
         g_freeStacks[g_nFreeStacks++] = t->stackTop;
     rt_signal_obj(t);
@@ -623,8 +653,8 @@ const char *rt_game_dir(void) { return g_gameDir; }
 // name does not exist. Missing components stay as given (new files keep the game's spelling).
 static void rt_fix_case(char *path, int keep)
 {
-#ifdef __APPLE__
-    (void)path; (void)keep;     // APFS/HFS+ default volumes are case-insensitive
+#if defined(__APPLE__) || defined(_WIN32)
+    (void)path; (void)keep;     // APFS/HFS+ default volumes and NTFS are case-insensitive
 #else
     struct stat st;
     if (stat(path, &st) == 0) return;
@@ -763,6 +793,18 @@ void RT_Fatal(const char *what, uint32_t addr)
     _exit(1);
 }
 
+#ifdef _WIN32
+static void crash_report(unsigned code, void *pc, void *addr)
+{
+    (void)code; (void)pc;
+    fprintf(stderr, "    thread %x\n", t_self ? t_self->tid : 0);
+    if ((uint8_t *)addr >= MEM - RT_GUEST_ALIAS && (uint8_t *)addr < MEM + RT_GUEST_SIZE)
+        fprintf(stderr, "    fault address is guest address 0x%08x\n", (unsigned)((uint8_t *)addr - MEM));
+    print_guest_state();
+}
+
+void rt_install_crash_handler(void) { rt_win_install_crash_handler(crash_report); }
+#else
 // Host crashes (SIGSEGV etc.): report where, with a host backtrace and the guest registers, so a
 // crash on a device without a debugger can be located from log.txt (addr2line / nm on the binary).
 static void crash_handler(int sig, siginfo_t *si, void *uc)
@@ -805,6 +847,18 @@ void rt_install_crash_handler(void)
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
     for (int i = 0; i < 5; i++) sigaction(sigs[i], &sa, 0);
+}
+#endif
+
+// Guest memory the host is about to hand to the system to write (ReadFile): Windows commits
+// the guest memory on first touch, which the kernel does not trigger.
+void rt_guest_commit(uint32_t addr, uint32_t size)
+{
+#ifdef _WIN32
+    rt_win_commit(MEM + addr, size);
+#else
+    (void)addr; (void)size;
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------

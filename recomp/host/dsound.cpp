@@ -555,6 +555,7 @@ void imp_mmioRead()
 {
     FILE *f = MmioFile(ARG(0));
     if (!f) RT_RETURN(0xffffffffu, 12);
+    rt_guest_commit(ARG(1), ARG(2));
     RT_RETURN((uint32_t)fread(MEM + ARG(1), 1, ARG(2), f), 12);
 }
 void imp_mmioWrite()

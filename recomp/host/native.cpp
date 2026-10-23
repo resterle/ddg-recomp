@@ -332,6 +332,9 @@ static double GameMInstrPerTick()
 // CPU time of all threads (game, driver, audio...) per tick since the previous call, 600 ticks
 static double ProcessCpuMsPerTick()
 {
+#ifdef _WIN32
+    return 0;
+#else
     static double last;
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -339,6 +342,7 @@ static double ProcessCpuMsPerTick()
     double d = last ? (now - last) / 600 : 0;
     last = now;
     return d;
+#endif
 }
 static uint32_t g_presents, g_presentsLate;       // presents, and those > 20 ms after the previous one
 static uint64_t g_presentGapMaxNs;
@@ -837,7 +841,7 @@ NATIVE N_004074a0(void)
                 task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&ti, &cnt);
                 mi.resident_size = ti.resident_size;
             }
-#else
+#elif !defined(_WIN32)
             if (FILE *sf = fopen("/proc/self/statm", "r")) {
                 unsigned long pages = 0, rss = 0;
                 if (fscanf(sf, "%lu %lu", &pages, &rss) == 2) mi.resident_size = (uint64_t)rss * (uint64_t)sysconf(_SC_PAGESIZE);
@@ -1168,7 +1172,7 @@ static std::string PrefDir()
     if (char *pref = SDL_GetPrefPath("TAITO", "DengoFinal")) {
         d = pref;
         SDL_free(pref);
-        if (!d.empty() && d.back() == '/') d.pop_back();
+        if (!d.empty() && (d.back() == '/' || d.back() == '\\')) d.pop_back();
     }
     return d;
 }
@@ -1291,8 +1295,15 @@ static const LauncherPrepare kPrepare = {
 };
 #endif
 
+#ifdef _WIN32
+extern "C" void rt_win_init(void);                   // host/os_win.c
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    rt_win_init();
+#endif
     rt_install_crash_handler();
     rt_profile_start();
     rt_reserve_guest_memory();          // before SDL/GPU drivers take address space (see runtime.c)

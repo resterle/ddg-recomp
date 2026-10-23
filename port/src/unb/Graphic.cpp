@@ -18,7 +18,9 @@
 
 #include "Graphic.h"
 #include <cstdlib>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include "GraphicShaders.h"
 #include "GraphicShadersSPV.h"     // the same shaders as SPIR-V (Vulkan), from shaders/scene.glsl
 #include "Texture.h"            // ps2:: decoders, shared with CTexture
@@ -479,11 +481,13 @@ static bool Flush()
     g_stats.drawCmds += (uint32_t)g->draws.size();
     // debugging: RECOMP_TRACE_FLUSH=<frame serial> prints who flushed during that frame
     if (const char *t = CACHED_ENV("RECOMP_TRACE_FLUSH"); t && g_frameSerial == strtoul(t, nullptr, 10)) {
+        const char *who = "?";
+#ifndef _WIN32
         Dl_info info = {};
         void *caller = __builtin_return_address(0);
-        dladdr(caller, &info);
-        fprintf(stderr, "flush from %s (draws %zu, upload %u bytes)\n", info.dli_sname ? info.dli_sname : "?",
-                g->draws.size(), uploadSize);
+        if (dladdr(caller, &info) && info.dli_sname) who = info.dli_sname;
+#endif
+        fprintf(stderr, "flush from %s (draws %zu, upload %u bytes)\n", who, g->draws.size(), uploadSize);
     }
     g_stats.uploadBytes += uploadSize;
     g_stats.vertexBytes += vbytes;
@@ -1630,7 +1634,11 @@ bool CGraphic::PrintScreen()
         if (s) {
             time_t now = time(nullptr);
             struct tm lt;
+#ifdef _WIN32
+            localtime_s(&lt, &now);
+#else
             localtime_r(&now, &lt);
+#endif
             SDL_CreateDirectory("snapshot");
             char path[64];
             SDL_snprintf(path, sizeof(path), "snapshot/%02d%02d%02d%02d%02d%02d%02d.bmp", lt.tm_year % 100,

@@ -70,6 +70,7 @@ uint32_t rt_heap_alloc(uint32_t size, int zero);
 uint32_t rt_heap_top(void);
 uint64_t rt_heap_live(void);        // bytes in allocated heap blocks
 uint64_t rt_guest_rss_kb(void);     // resident guest memory (Linux)
+void rt_guest_commit(uint32_t addr, uint32_t size);   // before the system writes guest memory (Windows)
 uint32_t rt_virt_top(void);         // end of the VirtualAlloc region in use
 uint64_t rt_thread_instructions(void);           // this thread's retired instructions (macOS)
 uint64_t rt_locked_instructions(void);           // total retired while holding the runtime lock                    // end of the used heap area (diagnostics)

@@ -87,6 +87,7 @@ player's aspect and draw distance then replace the neutral values (below).
 | `recomp/verify.py`, `gen.py`, `rt_test.c` | Differential tester (Unicorn vs translated C) |
 | `recomp/host/runtime.c` | Memory, PE loader, dispatch, threads/GIL, heap, path mapping |
 | `recomp/host/win32.c` | Win32 API shim |
+| `recomp/host/os_win.c`, `host/win/include/` | Windows builds: the POSIX subset the runtime uses, emulated memory, fibers, crash report (§3m); `recomp/windows/build-cross.sh` |
 | `recomp/host/native.cpp` | Natives (WinMain, message loop, DMA send, textures, models, input, movie) + test hooks |
 | `recomp/iterate.sh` | Run → on "unknown address" trap regenerate/rebuild → repeat |
 | `recomp/tools/` | Scripted-run helpers (`nav.sh`, `drive_keys.sh`), screenshot tools (`magcount.py`, `montage.py`), `histo.py` (instruction histogram); see §6 |
@@ -832,6 +833,41 @@ release scripts (`recomp/linux/release-deps.sh`, `build-release.sh`, `recomp/mac
 pack the program with SDL3, README-release.txt, SOURCE.txt (the commit, for the GPL) and the
 licences of everything inside. The macOS script has not run yet (no Mac here): its first runs on
 the GitHub runner will show what is missing.
+
+### 3m. Windows (x86-64, 2026-10-23)
+
+`recomp/windows/build-cross.sh` builds `build/win-x64/perfect_recomp.exe` (with the game code,
+like build-desktop.sh) on Linux with llvm-mingw (clang 23, UCRT) and SDL3's MinGW package; the
+exe needs only SDL3.dll and system DLLs. The renderer is SDL GPU on Vulkan (Graphic.cpp offers
+MSL and SPIR-V, so SDL does not pick D3D12, which would need DXIL shaders). The Makefile
+recognises a Windows compiler by `$(CC) -dumpmachine`.
+
+The runtime keeps its POSIX code: `host/win/include` (first on the include path of Windows
+builds) has the pthread.h, unistd.h, dirent.h and sched.h subset it uses, implemented in
+`host/os_win.c` on Win32 (SRW locks and condition variables, `_beginthreadex`, high-resolution
+waitable timers for `usleep`, QueryPerformanceCounter, FindFirstFile). MinGW's own POSIX layer
+(winpthreads) is not used, so a later MSVC-ABI build (clang-cl, needed for the shareable program:
+the Windows builds of python-build-standalone and LLVM are MSVC) compiles the same code.
+os_win.c is the only file with `<windows.h>` (its names collide with the Win32 shim's).
+
+- **Emulated memory**: one pagefile-backed section of 4 GB, mapped at `RT_MEM_BASE` and again
+  below it (guestmem.h). Only reserved: a vectored exception handler commits 64 KB on the first
+  touch, and `rt_guest_commit` before `fread` into guest memory (the kernel's ReadFile fails on
+  uncommitted pages instead of faulting). Committing everything would charge 4 GB against the
+  commit limit.
+- **Fibers** (game tasks, 3f): Windows fibers (`CreateFiberEx`, `FIBER_FLAG_FLOAT_SWITCH`)
+  instead of rt_ctx_switch, so that the TIB's stack bounds match the running stack (stack
+  probes, and `longjmp`, which unwinds on Windows).
+- **Crash report**: an unhandled-exception filter prints the code, module+offset of the pc and of
+  a host backtrace (llvm-symbolizer), then the guest registers. No profiler (RECOMP_PROFILE).
+- Case-insensitive file names need no lookup (NTFS); `timeBeginPeriod(1)` at start.
+
+Under wine 11 (Vulkan via the host's RADV) the Osaka loop drive runs at 60 ticks/s, game code
+1.5 ms/tick as on Linux (the Windows x64 calling convention returns the translated functions'
+16-byte RtRet in memory, which costs nothing measurable), render 4 ms/tick against 3.6 natively.
+The settings window, sound (WASAPI) and saves work. Not yet tried on a real Windows PC. Still
+open: the shareable RECOMP_JIT program for Windows (MSVC ABI, COFF in the JIT) and a release job;
+the console window (stderr) and UTF-8 paths (an application manifest with `activeCodePage`).
 
 ## 4. How the recompiler works (essentials)
 

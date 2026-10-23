@@ -10,7 +10,9 @@
 #pragma once
 #include <stdint.h>
 #include <stdio.h>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 #define RT_GUEST_SIZE (1ull << 32)
 #define RT_GUEST_ALIAS RT_GUEST_SIZE      // alias size below the base
@@ -56,6 +58,17 @@ static inline int rt_guest_realias(uint8_t *base)
                                      FALSE, &cur, &max, VM_INHERIT_SHARE);
     return kr == KERN_SUCCESS;
 }
+
+#elif defined(_WIN32)   // a section mapped twice (host/os_win.c)
+#include <stddef.h>
+uint8_t *rt_win_map_guest_memory(uint64_t want, uint64_t size, uint64_t alias);
+
+static inline uint8_t *rt_map_guest_memory(uint64_t want)
+{
+    return rt_win_map_guest_memory(want, RT_GUEST_SIZE, RT_GUEST_ALIAS);
+}
+
+static inline int rt_guest_realias(uint8_t *base) { (void)base; return 1; }     // no fork()
 
 #else   // Linux: one memfd mapped twice
 #include <sys/syscall.h>

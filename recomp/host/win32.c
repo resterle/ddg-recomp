@@ -288,6 +288,7 @@ static void imp_ReadFile(void)
     FILE *f = file_of(ARG(0));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    rt_guest_commit(ARG(1), ARG(2));
     size_t n = f ? fread(MEM + ARG(1), 1, ARG(2), f) : 0;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_readNs += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
@@ -702,6 +703,7 @@ static void imp_MapViewOfFile(void)
     uint32_t size = (uint32_t)ftello(m->f);
     uint32_t a = rt_heap_alloc(size ? size : 1, 0);
     fseeko(m->f, 0, SEEK_SET);
+    rt_guest_commit(a, size);
     size_t got = fread(MEM + a, 1, size, m->f);
     (void)got;
     fseeko(m->f, cur, SEEK_SET);

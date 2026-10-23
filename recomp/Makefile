@@ -27,11 +27,21 @@ else
 MEMBASE    ?= 0x400000000
 endif
 DEFS       := -DRT_MEM_BASE=$(MEMBASE)
+# Windows x86-64: CC/CXX are a clang for x86_64-w64-mingw32 (llvm-mingw) or x86_64-pc-windows-msvc,
+# SDL_PREFIX the SDL3 development package for it. host/win/include stands in for the POSIX
+# headers (host/os_win.c implements them).
+WIN        := $(if $(or $(findstring mingw,$(shell $(CC) -dumpmachine)),$(findstring windows,$(shell $(CC) -dumpmachine))),1,)
+ifeq ($(WIN),1)
+DEFS       += -Ihost/win/include
+SDL_LIBS   := $(SDL_PREFIX)/lib/libSDL3.dll.a
+WIN_LIBS   := -lwinmm
+EXE        := .exe
+endif
 GFX        := $(if $(filter gl,$(RENDERER)),GraphicGL,Graphic)
 GFXDEFS    := $(if $(filter gl,$(RENDERER)),-DRECOMP_GL,)
 # objects per renderer/target (native.o differs); OBJ=build/obj-<name> for cross builds
 OBJ        ?= build/obj$(if $(filter gl,$(RENDERER)),-gl,)
-TARGET     ?= perfect_recomp$(if $(filter gl,$(RENDERER)),_gl,)
+TARGET     ?= perfect_recomp$(if $(filter gl,$(RENDERER)),_gl,)$(EXE)
 # ThinLTO for the translated code (cross-file inlining of small functions); LTO=0 to disable
 LTO        ?= 1
 LTOFLAGS   := $(if $(filter 1,$(LTO)),-flto=thin,)
@@ -44,6 +54,9 @@ GAME_SRC := $(wildcard build/game/*.c)
 GAME_OBJ := $(patsubst build/game/%.c,$(OBJ)/game/%.o,$(GAME_SRC))
 HOST_OBJ := $(OBJ)/host/runtime.o $(OBJ)/host/win32.o $(OBJ)/host/native.o $(OBJ)/host/launcher.o $(OBJ)/host/overlay.o $(OBJ)/host/d3dx.o $(OBJ)/host/dsound.o $(OBJ)/host/tasks.o
 PORT_SRC := $(GFX) Texture Gs Dma Vertex
+ifeq ($(WIN),1)
+HOST_OBJ += $(OBJ)/host/os_win.o
+endif
 # RECOMP_JIT=1: the program without the game code. On the first start with an exe it translates
 # it with the built-in Python (host/pyembed.cpp), compiles the C with the built-in clang/LLVM and
 # runs it with LLVM's JIT, caching both (host/jit.cpp; prototype). LLVM_CONFIG: the LLVM to build
@@ -83,7 +96,7 @@ PORT_OBJ := $(patsubst %,$(OBJ)/port/%.o,$(PORT_SRC))
 
 $(TARGET): $(GAME_OBJ) $(HOST_OBJ) $(PORT_OBJ) $(if $(filter 1,$(RECOMP_JIT)),$(OBJ)/py/link.txt)
 	@mkdir -p $(dir $@)
-	$(CXX) $(PGOFLAGS) $(TUNE) $(LTOFLAGS) -o $@ $(filter %.o,$^) $(SDL_LIBS) $(JIT_LIBS) $(LDEXTRA)
+	$(CXX) $(PGOFLAGS) $(TUNE) $(LTOFLAGS) -o $@ $(filter %.o,$^) $(SDL_LIBS) $(JIT_LIBS) $(WIN_LIBS) $(LDEXTRA)
 
 $(OBJ)/game/%.o: build/game/%.c recomp_rt.h
 	@mkdir -p $(dir $@)
