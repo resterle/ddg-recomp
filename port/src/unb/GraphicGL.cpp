@@ -144,6 +144,7 @@ constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
     X(void, BindRenderbuffer, (GLenum, GLuint)) \
     X(void, RenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) \
     X(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)) \
+    X(void, CopyTexSubImage2D, (GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei)) \
     X(void, GenBuffers, (GLsizei, GLuint *)) \
     X(void, DeleteBuffers, (GLsizei, const GLuint *)) \
     X(void, BindBuffer, (GLenum, GLuint)) \
@@ -534,6 +535,8 @@ struct CGraphic::Impl {
     uint32_t uboStride = 0;                         // sizeof(ParamBlock) rounded to the offset alignment
     std::unordered_map<uint32_t, GLuint> samplers;
     GLuint depthRB = 0, vao2D = 0, vaoMesh = 0, vb2D = 0, arenaVB = 0;
+    GLuint targetCopy = 0;                          // what a draw sampling its own target reads
+    uint32_t targetCopyW = 0, targetCopyH = 0;
     // batching: runs of order-independent mesh draws are sorted by state and merged; their vertices
     // are copied into one stream per flush (one draw call per state instead of one per model)
     bool batching = true;
@@ -2636,6 +2639,24 @@ static void Execute(Job &j)
                         lastTexArray = d.pTex->arr->id;
                         g_cTex++;
                     }
+                } else if (d.pTex == &rt) {
+                    // The screen effect blends the scene into itself (slot 0 while rendering to
+                    // slot 0). Sampling the texture of the bound FBO is undefined (a feedback
+                    // loop; tile-based GPUs return garbage along tile rows), so sample a copy of
+                    // the target as drawn so far, with the same row order (flipV still applies).
+                    if (!g->targetCopy || g->targetCopyW != rt.nWidth || g->targetCopyH != rt.nHeight) {
+                        if (g->targetCopy) gl.DeleteTextures(1, &g->targetCopy);
+                        uint32_t levels = 1;
+                        bool reused;
+                        g->targetCopy = AllocTexture(rt.nWidth, rt.nHeight, rt.nFormat, true, levels, false, reused);
+                        g->targetCopyW = rt.nWidth;
+                        g->targetCopyH = rt.nHeight;
+                    } else {
+                        gl.BindTexture(GL_TEXTURE_2D, g->targetCopy);
+                    }
+                    gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, rt.nWidth, rt.nHeight);
+                    lastTex = g->targetCopy;
+                    g_cTex++;
                 } else {
                     GLuint texId = !d.pTex ? g->white->id : d.pTex->id ? d.pTex->id : d.pTex->standIn;
                     if (texId != lastTex) { gl.BindTexture(GL_TEXTURE_2D, texId); lastTex = texId; g_cTex++; }

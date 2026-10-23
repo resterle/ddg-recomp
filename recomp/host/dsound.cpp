@@ -17,6 +17,7 @@
 
 #include "runtime.h"
 #include <SDL3/SDL.h>
+#include <cstdlib>
 
 #include <atomic>
 #include <cmath>

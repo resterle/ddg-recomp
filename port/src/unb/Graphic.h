@@ -92,6 +92,9 @@ struct GRAPHIC_CONFIG {
     int screffect = 7;      // non-zero keeps the previous frame available as texture slot 1
     int snapshot = 0;       // allow PrintScreen
     int crop = 1;           // new: show only the game's 600x420 canvas, at 4:3 (0 = whole 640x480 target)
+    int texdump = 0;        // new: write each new texture to <settings>/texdump/ (TexturePack.h)
+    int texpack = 1;        // new: replace textures with the PNGs in <settings>/textures/
+    int texpackmem = 1024;  // new: MB of decoded replacements kept for reuse
 };
 
 class CGraphic {

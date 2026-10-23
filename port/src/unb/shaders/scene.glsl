@@ -97,13 +97,14 @@ bool alphaPasses(uint func, float a, float ref)
 }
 
 // false: the fragment fails the alpha test
-bool shade(vec4 color, vec2 uv, FSParams p, out vec4 c)
+// uvDx, uvDy: derivatives of uv, taken by the caller in uniform control flow (they are undefined
+// in this per-draw branch); they select the mip level of texture pack replacements, the game's
+// own textures have only level 0
+bool shade(vec4 color, vec2 uv, vec2 uvDx, vec2 uvDy, FSParams p, out vec4 c)
 {
     c = color;
     if (p.mode != 0u) {
-        // explicit LOD: every texture has one mip level, and derivatives are undefined in this
-        // per-draw (non-uniform) branch
-        vec4 t = p.mode == 2u ? samplePaletted(uv, p) : textureLod(tex, uv, 0.0);
+        vec4 t = p.mode == 2u ? samplePaletted(uv, p) : textureGrad(tex, uv, uvDx, uvDy);
         c = vec4(combine(p.colorOp, t, color).rgb, combine(p.alphaOp, t, color).a);
     }
     return p.alphaTest == 0u || alphaPasses(p.alphaFunc, floor(c.a * 255.0 + 0.5), p.alphaRef * 255.0);
@@ -140,8 +141,9 @@ layout(set = 3, binding = 0) uniform FSBlock { FSParams p; };
 
 void main()
 {
+    vec2 dx = dFdx(vUV), dy = dFdy(vUV);
     vec4 c;
-    if (!shade(vColor, vUV, p, c)) discard;
+    if (!shade(vColor, vUV, dx, dy, p, c)) discard;
     fragColor = c;
 }
 #endif
@@ -210,9 +212,10 @@ layout(std430, set = 2, binding = 2) readonly buffer MeshFSBuf { MeshFS params[]
 
 void main()
 {
+    vec2 dx = dFdx(vUV), dy = dFdy(vUV);
     MeshFS f = params[vParam];
     vec4 c;
-    if (!shade(vColor, vUV, f.p, c)) discard;
+    if (!shade(vColor, vUV, dx, dy, f.p, c)) discard;
     if (f.fogOn != 0u) c.rgb = mix(vec3(f.fogR, f.fogG, f.fogB), c.rgb, clamp(vFog, 0.0, 1.0));
     fragColor = c;
 }

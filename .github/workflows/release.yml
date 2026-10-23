@@ -40,8 +40,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Tools (Homebrew LLVM and lld)
-        run: brew install llvm lld cmake ninja zstd
+      - name: Tools (LLVM itself comes from build-release.sh)
+        run: brew install cmake ninja zstd
       - uses: actions/cache@v4
         with:
           path: recomp/build/release-cache-macos

@@ -31,6 +31,7 @@ port/gs_demo
 port/dma_demo
 port/model_demo
 port/txm2png
+port/texpack_extract
 port/cull_test
 port/*.dSYM/
 port/snapshot/

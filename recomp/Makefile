@@ -19,10 +19,12 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS   := $(shell pkg-config --libs sdl3)
 endif
 OPT        ?= -O2
-# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000; Linux
-# kernels with 39-bit address spaces (common on ARM handhelds) end at 0x8000000000.
+# Fixed address of the emulated 4 GB. macOS refuses fixed allocations below 0x7000000000 and puts
+# malloc's regions at random places in 0x7000000000-0x8000000000 before main runs (sometimes over a
+# base there), so it goes to 1 TB; Linux kernels with 39-bit address spaces (common on ARM
+# handhelds) end at 0x8000000000.
 ifeq ($(shell uname -s),Darwin)
-MEMBASE    ?= 0x8000000000
+MEMBASE    ?= 0x10000000000
 else
 MEMBASE    ?= 0x400000000
 endif
@@ -53,7 +55,7 @@ TUNE       ?=
 GAME_SRC := $(wildcard build/game/*.c)
 GAME_OBJ := $(patsubst build/game/%.c,$(OBJ)/game/%.o,$(GAME_SRC))
 HOST_OBJ := $(OBJ)/host/runtime.o $(OBJ)/host/win32.o $(OBJ)/host/native.o $(OBJ)/host/launcher.o $(OBJ)/host/overlay.o $(OBJ)/host/d3dx.o $(OBJ)/host/dsound.o $(OBJ)/host/tasks.o
-PORT_SRC := $(GFX) Texture Gs Dma Vertex
+PORT_SRC := $(GFX) Texture TexturePack Gs Dma Vertex
 ifeq ($(WIN),1)
 HOST_OBJ += $(OBJ)/host/os_win.o
 endif
@@ -80,6 +82,7 @@ JIT_CXXFLAGS := -I$(LLVM_PREFIX)/include -std=c++17 -D_GNU_SOURCE -D__STDC_CONST
 # exported for the game code (the JIT finds the host by dlsym): only the runtime's interface, so
 # that the linker can drop the unused parts of LLVM and clang. LLVM_SYSLIBS: what the LLVM build
 # needs besides (llvm-config --link-static --system-libs, e.g. -lz -lzstd)
+# (libPolly*: Homebrew's and apt.llvm.org's LLVM are built with Polly, which the pass builder calls)
 LLVM_ARCHIVES := $(filter-out %/libclang.a,$(wildcard $(LLVM_PREFIX)/lib/libclang*.a $(LLVM_PREFIX)/lib/libLLVM*.a $(LLVM_PREFIX)/lib/libPolly*.a))
 ifeq ($(shell uname -s),Darwin)
 JIT_LIBS   = $(PY_LIBS) $(LLVM_ARCHIVES) $(LLVM_SYSLIBS) -Wl,-exported_symbols_list,host/jit-exports-macos.txt -Wl,-dead_strip -Wl,-dead_strip_dylibs -lpthread -lm

@@ -19,6 +19,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/thread.h"
 #include "llvm/TargetParser/Host.h"
 
 #include <atomic>
@@ -29,6 +30,7 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -46,7 +48,10 @@ static std::mutex g_progLock;
 static std::string g_progExe, g_progText, g_pending;
 static int g_progState;                     // 0 working, 1 ready, -1 failed (for g_progExe)
 static bool g_working;
-static std::thread g_worker;
+// clang and the translator recurse deeply: their threads get 16 MB of stack (secondary threads have
+// 512 KB on macOS, and compiling crashed with a stack overflow there; Linux gives 8 MB)
+static constexpr unsigned kStack = 16u << 20;
+static llvm::thread g_worker;
 
 static void progress(const std::string &text, int state = 0)
 {
@@ -225,9 +230,9 @@ static int load(const std::string &srcDir)
             progress(t);
         };
         show();
-        std::vector<std::thread> pool;
+        std::vector<llvm::thread> pool;
         for (unsigned t = 0; t < std::min<size_t>(jobs, files.size()); t++)
-            pool.emplace_back([&] {
+            pool.emplace_back(std::optional<unsigned>(kStack), [&] {
                 for (size_t k; (k = next++) < order.size() && !failed;) {
                     size_t i = order[k];
                     llvm::SmallVector<char, 0> obj;
@@ -290,11 +295,16 @@ static int load(const std::string &srcDir)
     }
     for (auto &o : objs)
         if (auto e = J.addObjectFile(std::move(o))) { fprintf(stderr, "game code: %s\n", llvm::toString(std::move(e)).c_str()); return 0; }
+    const void *syms[sizeof kSyms / sizeof kSyms[0]];
     for (size_t i = 0; i < sizeof kSyms / sizeof kSyms[0]; i++) {
         auto a = J.lookup(kSyms[i]);
         if (!a) { fprintf(stderr, "game code: %s\n", llvm::toString(a.takeError()).c_str()); return 0; }
-        rt_jit_sym[i] = a->toPtr<const void *>();
+        syms[i] = a->toPtr<const void *>();
     }
+    // the settings window checks the exe meanwhile (runtime.c read_exe), taking rt_jit_sym[0] for
+    // "the game code is there": set it last (it crashed reading rt_jit_sym[4] before it was set)
+    for (size_t i = 1; i < sizeof kSyms / sizeof kSyms[0]; i++) rt_jit_sym[i] = syms[i];
+    __atomic_store_n(&rt_jit_sym[0], syms[0], __ATOMIC_RELEASE);
     jit->release();                             // the code lives as long as the program
     auto t2 = clock::now();
     auto ms = [](auto a, auto b) { return (double)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
@@ -359,7 +369,7 @@ extern "C" void rt_jit_start(const char *exe)
     if (!g_working) {
         if (g_worker.joinable()) g_worker.join();
         g_working = true;
-        g_worker = std::thread(work);
+        g_worker = llvm::thread(std::optional<unsigned>(kStack), work);
     }
 }
 

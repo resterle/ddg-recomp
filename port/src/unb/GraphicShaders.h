@@ -125,15 +125,15 @@ static bool alphaPasses(uint func, float a, float ref)
     }
 }
 
-static float4 shade(float4 color, float2 uv, const thread FSParams &p, texture2d<float> tex, texture2d<float> pal,
-                    sampler smp)
+// uvDx, uvDy: derivatives of uv, taken by the caller in uniform control flow (implicit ones are
+// undefined in this per-draw branch); they select the mip level of texture pack replacements, the
+// game's own textures have only level 0.
+static float4 shade(float4 color, float2 uv, float2 uvDx, float2 uvDy, const thread FSParams &p, texture2d<float> tex,
+                    texture2d<float> pal, sampler smp)
 {
     float4 c = color;
     if (p.mode != 0) {
-        // Explicit LOD: every texture has one mip level, and implicit derivatives are undefined
-        // in this per-draw (non-uniform) branch; on Apple GPUs that gave garbage texels along
-        // 16/32-pixel rows (magenta lines in the sky).
-        float4 t = p.mode == 2 ? samplePaletted(tex, pal, uv, p) : tex.sample(smp, uv, level(0.0));
+        float4 t = p.mode == 2 ? samplePaletted(tex, pal, uv, p) : tex.sample(smp, uv, gradient2d(uvDx, uvDy));
         c = float4(combine(p.colorOp, t, color).rgb, combine(p.alphaOp, t, color).a);
     }
     if (p.alphaTest != 0 && !alphaPasses(p.alphaFunc, floor(c.a * 255.0 + 0.5), p.alphaRef * 255.0)) {
@@ -149,8 +149,9 @@ fragment float4 fs_main(VSOut in [[stage_in]], constant FSParams &p [[buffer(0)]
                         texture2d<float> tex [[texture(0)]], texture2d<float> pal [[texture(1)]],
                         sampler smp [[sampler(0)]], sampler palSmp [[sampler(1)]])
 {
+    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);
     FSParams lp = p;
-    return shade(in.color, in.uv, lp, tex, pal, smp);
+    return shade(in.color, in.uv, dx, dy, lp, tex, pal, smp);
 }
 
 // ---- 3D models: the four vertex shaders of the original (cddata/vsh) in one function ----
@@ -239,12 +240,13 @@ fragment float4 fs_mesh(MeshOut in [[stage_in]], const device MeshFS *params [[b
     if (any(isnan(in.uv)) || any(isinf(in.uv))) return float4(1.0, 0.0, 0.0, 1.0);
     return float4(fract(in.uv.x) * 0.5, fract(in.uv.y) * 0.5, abs(in.uv.y) > 4.0 ? 1.0 : 0.0, 1.0);
 #endif
+    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);
     const MeshFS f = params[in.param];
     FSParams fp = f.p;
 #ifdef DEBUG_MESH_PARAMS
     return float4(float(fp.mode) / 4.0, float(fp.colorOp) / 8.0, float(fp.alphaOp) / 8.0, 1.0);
 #endif
-    float4 c = shade(in.color, in.uv, fp, tex, pal, smp);
+    float4 c = shade(in.color, in.uv, dx, dy, fp, tex, pal, smp);
 #ifdef DEBUG_MESH_SHADE
     return c.a > 1.5 ? float4(0.0, 1.0, (c.a - 2.0), 1.0) : float4(c.rgb, 1.0);
 #endif

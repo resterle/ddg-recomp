@@ -113,7 +113,7 @@ def main():
         records.append(('translator/' + f, open(os.path.join(RECOMP, f), 'rb').read()))
     for d, _, files in os.walk(os.path.join(pylib, 'capstone')):
         for f in files:
-            if f.endswith('.py') or f.endswith('.so') or '.so.' in f:
+            if f.endswith(('.py', '.so', '.dylib')) or '.so.' in f:     # the library: .so, macOS .dylib
                 p = os.path.join(d, f)
                 records.append(('pylib/' + os.path.relpath(p, pylib).replace(os.sep, '/'), open(p, 'rb').read()))
     with open(os.path.join(out, 'runtime.bin'), 'wb') as f:
