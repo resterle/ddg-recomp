@@ -1081,10 +1081,13 @@ Count translated calls with `make DEFS="-DRT_MEM_BASE=0x8000000000 -DRT_COUNT_SA
 8. 118 functions fail translation (MMX/SSE/3DNow! D3DX math). Not hit so far; if a trap reports
    one, add the instructions to `x86lift.py` or make the function native.
 9. The debug hooks in §6 are compiled in permanently; they cost nothing unless set.
-10. **Noise in the sky with the SDL GPU renderer on Vulkan** (desktop Linux, 2026-10-22): in the
-   Osaka loop drive at 85 s, the upper part of the sky shows coloured random pixels in the
-   snapshot (`RECOMP_SHOT_AFTER`), with the Docker build and with the builder's. The GL builds
-   draw it correctly. Probably an uninitialised texture or render target. Not looked into yet.
+10. **Noise in the sky with the SDL GPU renderer on Vulkan** (fixed 2026-10-23): the game blends
+   its own picture onto itself (a full-canvas quad that samples scene target 0 while drawing into
+   it, shifted by one line at half strength, to soften the picture; another quad blends in target
+   1, the previous frame). Reading a color target in its own render pass is undefined in Vulkan
+   (streaky noise where the sky is). Graphic.cpp now flushes, copies the target and lets such a
+   draw read the copy (`FeedbackCopy`), which is what the PS2 saw. The GL builds draw from the
+   target itself (a feedback loop too, but the drivers tested give the expected picture).
 
 How to tackle a new crash: run `./iterate.sh` (handles discovery); for other traps read the
 backtrace (`stack:` list of return addresses), look the function up in Ghidra (or a local `out/perfect_all.c`), and

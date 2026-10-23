@@ -133,6 +133,7 @@ struct CGraphic::Impl {
     SDL_GPUSampler *pPresentSampler = nullptr;
     SDL_GPUSampler *pOverlaySampler = nullptr;      // nearest (CGraphic::SetOverlay)
     SDL_GPUTexture *pOverlayTex = nullptr;
+    CGraphicTexture *pFeedback = nullptr;           // copy of the target for draws that sample it (FeedbackCopy)
     int overlayTexW = 0, overlayTexH = 0;
     uint32_t overlayVersion = 0;
 
@@ -700,9 +701,49 @@ static void FillTexture(DrawCmd &d)
     }
 }
 
+// A draw that samples the scene target it draws into: the game blends its own picture onto itself
+// (shifted by a line, at half strength, to soften it). A color target read in its own render pass
+// is undefined in Vulkan (noise over the sky) and Metal; the PS2 read what was drawn so far. So:
+// flush the recorded draws, copy the target and let the draw read the copy.
+static CGraphicTexture *MakeRenderTarget(uint32_t w, uint32_t h);
+
+static CGraphicTexture *FeedbackCopy()
+{
+    CGraphicTexture &rt = *g->tex[g->target];
+    if (!Flush()) return nullptr;
+    SDL_GPUDevice *dev = CGraphic::GetDevice();
+    if (g->pFeedback && (g->pFeedback->nWidth != rt.nWidth || g->pFeedback->nHeight != rt.nHeight)) {
+        SDL_ReleaseGPUTexture(dev, g->pFeedback->pTex);
+        delete g->pFeedback;
+        g->pFeedback = nullptr;
+    }
+    if (!g->pFeedback && !(g->pFeedback = MakeRenderTarget(rt.nWidth, rt.nHeight))) return nullptr;
+    g->pFeedback->nUVWidth = rt.nUVWidth;
+    g->pFeedback->nUVHeight = rt.nUVHeight;
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
+    if (!cmd) return nullptr;
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureLocation src = {}, dst = {};
+    src.texture = rt.pTex;
+    dst.texture = g->pFeedback->pTex;
+    SDL_CopyGPUTextureToTexture(copy, &src, &dst, rt.nWidth, rt.nHeight, 1, false);
+    SDL_EndGPUCopyPass(copy);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) return nullptr;
+    return g->pFeedback;
+}
+
 // Record vertices for the current state. Fans become lists because SDL GPU has no fan topology.
 static bool Record(const Vertex *v, uint32_t n)
 {
+    // sampling the target being drawn into: read a copy of it (FeedbackCopy)
+    CGraphicTexture *sampled = g->pCurTex;
+    if (g->textured && sampled && sampled == g->tex[g->target]) {
+        CGraphicTexture *copy = FeedbackCopy();
+        if (!copy) return false;
+        g->pCurTex = copy;
+    }
+    struct Restore { CGraphicTexture *&p; CGraphicTexture *v; ~Restore() { p = v; } } restore{g->pCurTex, sampled};
+
     if (CACHED_ENV("RECOMP_SKIP_2D") && g_frameSerial >= strtoul(CACHED_ENV("RECOMP_SKIP_2D"), nullptr, 10)) return true;   // debugging
     // debugging: RECOMP_SKIP_2D_SEQ="<first frame>:<step>" skips 2D draws [k*step, (k+1)*step) of each
     // frame during the k-th block of 60 frames
@@ -951,6 +992,7 @@ void CGraphic::Term()
         if (g->pPresentSampler) SDL_ReleaseGPUSampler(m_pDevice, g->pPresentSampler);
         if (g->pOverlaySampler) SDL_ReleaseGPUSampler(m_pDevice, g->pOverlaySampler);
         if (g->pOverlayTex) SDL_ReleaseGPUTexture(m_pDevice, g->pOverlayTex);
+        if (g->pFeedback) { SDL_ReleaseGPUTexture(m_pDevice, g->pFeedback->pTex); delete g->pFeedback; }
         for (SDL_GPUShader *s : {g->pVS[0], g->pVS[1], g->pFS[0], g->pFS[1], g->pMeshVS[0], g->pMeshVS[1],
                                  g->pMeshFS[0], g->pMeshFS[1], g->pPresentVS, g->pPresentFS})
             if (s) SDL_ReleaseGPUShader(m_pDevice, s);
