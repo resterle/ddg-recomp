@@ -966,7 +966,7 @@ static uint8_t *read_exe(const char *exe, long *psize, int *status)
         if (!strcmp(sec[i].name, "stxt774") || !strcmp(sec[i].name, "stxt371")) { *status = RT_EXE_SAFEDISC; free(d); return NULL; }
 #ifdef RECOMP_JIT
     // no game code yet (it is made from this exe): the translator checks the version
-    if (!rt_jit_sym[0]) { *status = RT_EXE_OK; *psize = size; return d; }
+    if (!__atomic_load_n(&rt_jit_sym[0], __ATOMIC_ACQUIRE)) { *status = RT_EXE_OK; *psize = size; return d; }
 #endif
     for (int i = 0; i < rt_exe_npatches; i++) {
         const RtExePatch *p = &rt_exe_patches[i];

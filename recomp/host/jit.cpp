@@ -295,11 +295,16 @@ static int load(const std::string &srcDir)
     }
     for (auto &o : objs)
         if (auto e = J.addObjectFile(std::move(o))) { fprintf(stderr, "game code: %s\n", llvm::toString(std::move(e)).c_str()); return 0; }
+    const void *syms[sizeof kSyms / sizeof kSyms[0]];
     for (size_t i = 0; i < sizeof kSyms / sizeof kSyms[0]; i++) {
         auto a = J.lookup(kSyms[i]);
         if (!a) { fprintf(stderr, "game code: %s\n", llvm::toString(a.takeError()).c_str()); return 0; }
-        rt_jit_sym[i] = a->toPtr<const void *>();
+        syms[i] = a->toPtr<const void *>();
     }
+    // the settings window checks the exe meanwhile (runtime.c read_exe), taking rt_jit_sym[0] for
+    // "the game code is there": set it last (it crashed reading rt_jit_sym[4] before it was set)
+    for (size_t i = 1; i < sizeof kSyms / sizeof kSyms[0]; i++) rt_jit_sym[i] = syms[i];
+    __atomic_store_n(&rt_jit_sym[0], syms[0], __ATOMIC_RELEASE);
     jit->release();                             // the code lives as long as the program
     auto t2 = clock::now();
     auto ms = [](auto a, auto b) { return (double)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };

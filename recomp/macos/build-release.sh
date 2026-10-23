@@ -7,7 +7,6 @@
 # llvm's static libraries are linked in), zstd, cmake and ninja. Linked with Apple's ld using
 # Homebrew's libLTO: ld64.lld left a dozen of libpython's own functions undefined (PyErr_Print,
 # PyThreadState_New, ...) even for a three-line program. Used by .github/workflows/release.yml.
-# Not yet tested on a Mac (only the Linux build was run): see docs/DEVELOPMENT.md.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 recomp=$(dirname "$here")
@@ -46,10 +45,28 @@ if ! ls "$cache"/capstone/*.whl >/dev/null 2>&1; then
         --platform macosx_11_0_arm64 -d "$cache/capstone" -q
 fi
 
+# Homebrew's clang archives hold members with the same name (Targets/X86.cpp.o and
+# TargetBuiltins/X86.cpp.o are both X86.cpp.o in libclangCodeGen.a); the ld of the macOS 14 runner
+# took one of each (EmitX86BuiltinExpr and the others undefined). $out/llvm: Homebrew's LLVM with
+# those archives repacked under unique member names, the others linked
+lp=$out/llvm
+rm -rf "$lp" && mkdir -p "$lp/lib"
+ln -s "$llvm/include" "$lp/include"
+for a in "$llvm"/lib/*.a; do
+    if [ -z "$("$llvm/bin/llvm-ar" t "$a" | sort | uniq -d)" ]; then ln -s "$a" "$lp/lib/"; continue; fi
+    t=$out/repack
+    rm -rf "$t" && mkdir -p "$t"
+    "$llvm/bin/llvm-ar" t "$a" | awk '{ print ++n[$0], NR, $0 }' | while read -r k i m; do
+        (cd "$t" && "$llvm/bin/llvm-ar" xN "$k" "$a" "$m" && mv "$m" "$(printf %04d "$i")-$m")
+    done
+    "$llvm/bin/llvm-ar" rcs "$lp/lib/$(basename "$a")" "$t"/*
+    rm -rf "$t"
+done
+
 # the program (Metal renderer)
 rm -f "$out/perfect_recomp"
 make -j"$(sysctl -n hw.ncpu)" RECOMP_JIT=1 RENDERER=gpu CC="$llvm/bin/clang" CXX="$llvm/bin/clang++" \
-    LLVM_PREFIX="$llvm" LLVM_SYSLIBS="-L$(brew --prefix zstd)/lib $("$llvm/bin/llvm-config" --link-static --system-libs)" \
+    LLVM_PREFIX="$lp" LLVM_SYSLIBS="-L$(brew --prefix zstd)/lib $("$llvm/bin/llvm-config" --link-static --system-libs)" \
     PY_PREFIX="$cache/pbs/python" CAPSTONE_WHEEL="$(ls "$cache"/capstone/*.whl | head -1)" \
     SDL_PREFIX="$cache/sdl3" SDL_LIBS="-L$cache/sdl3/lib -lSDL3" OBJ=build/obj-release-macos-arm64 \
     TARGET="$out/perfect_recomp" LDEXTRA="-fuse-ld=ld -Wl,-lto_library,$llvm/lib/libLTO.dylib -Wl,-rpath,@executable_path/../Frameworks"
