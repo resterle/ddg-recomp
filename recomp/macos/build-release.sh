@@ -55,13 +55,18 @@ if ! ls "$cache"/capstone/*.whl >/dev/null 2>&1; then
         --platform macosx_11_0_arm64 -d "$cache/capstone" -q
 fi
 
+# libLTO for Apple's ld, alone in a folder: Xcode 15's ld puts the folder of -lto_library on its
+# library path, and LLVM's libc++ next to libLTO then replaced the system's (dyld: Symbol not
+# found: __ZdaPv, ld aborted)
+mkdir -p "$cache/lto" && cp "$llvm/lib/libLTO.dylib" "$cache/lto/"
+
 # the program (Metal renderer)
 rm -f "$out/perfect_recomp"
 make -j"$(sysctl -n hw.ncpu)" RECOMP_JIT=1 RENDERER=gpu CC="$llvm/bin/clang" CXX="$llvm/bin/clang++" \
     LLVM_PREFIX="$llvm" LLVM_SYSLIBS="$("$llvm/bin/llvm-config" --link-static --system-libs)" \
     PY_PREFIX="$cache/pbs/python" CAPSTONE_WHEEL="$(ls "$cache"/capstone/*.whl | head -1)" \
     SDL_PREFIX="$cache/sdl3" SDL_LIBS="-L$cache/sdl3/lib -lSDL3" OBJ=build/obj-release-macos-arm64 \
-    TARGET="$out/perfect_recomp" LDEXTRA="-fuse-ld=ld -Wl,-lto_library,$llvm/lib/libLTO.dylib -Wl,-rpath,@executable_path/../Frameworks"
+    TARGET="$out/perfect_recomp" LDEXTRA="-fuse-ld=ld -Wl,-lto_library,$cache/lto/libLTO.dylib -Wl,-rpath,@executable_path/../Frameworks"
 
 # the app bundle
 app="$out/Densha de GO! FINAL.app"
